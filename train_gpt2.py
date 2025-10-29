@@ -104,7 +104,7 @@ def q_zero(bits=8):
 # Dataset for Mono Audio
 # =====================
 class MonoWavChunkDataset(Dataset):
-    def __init__(self, data_dir, chunk_size=4096, sample_rate=44100, bit_split=False, epoch_expansion_factor=10, only_lower_bits=False, stereo_interleave=False):
+    def __init__(self, data_dir, chunk_size=4096, sample_rate=44100, bit_split=False, epoch_expansion_factor=10, only_lower_bits=False, stereo_interleave=False, lb_dropout=0.0):
         self.files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.wav')]
         self.chunk_size = chunk_size
         self.sample_rate = sample_rate
@@ -112,6 +112,16 @@ class MonoWavChunkDataset(Dataset):
         self.epoch_expansion_factor = epoch_expansion_factor
         self.only_lower_bits = only_lower_bits
         self.stereo_interleave = stereo_interleave
+        self.lb_dropout = lb_dropout
+
+        # define mask token for lower bits dropout
+        match self.bit_split:
+            case 2:
+                self.lb_mask_token = 512
+            case 4:
+                self.lb_mask_token = 64
+            case 3:
+                self.lb_mask_token = 272
 
         if len(self.files) == 0:
             raise ValueError("files is empty")
@@ -163,6 +173,9 @@ class MonoWavChunkDataset(Dataset):
                 # add 2^8 to the low bits to distinguish them from high bits
                 low_bits += 256
                 # interleave high and low bits
+                if torch.rand(1).item() < self.lb_dropout:
+                    low_bits = torch.full_like(low_bits, self.lb_mask_token)
+
                 wav = torch.stack([high_bits, low_bits], dim=1).view(-1)
                 assert torch.all(wav[0] == high_bits[0])
                 assert torch.all(wav[1] == low_bits[0])
@@ -232,6 +245,10 @@ class GPTAudioLightningModule(pl.LightningModule):
             config.vocab_size = 256  # only low 8 bits
         else:
             config.vocab_size = 65536  # 16-bit tokens
+
+        if kwargs.get("lb_dropout", 0.0) > 0.0 and split_bit:
+            config.vocab_size += 1  # add mask token for lower bits dropout
+            self.lb_mask_token = config.vocab_size - 1
         config.max_position_embeddings = 2049
         self.model = GPT2LMHeadModel(config)
 
@@ -308,12 +325,46 @@ class GPTAudioLightningModule(pl.LightningModule):
             last_p_loss = avg_loss_per_pos[last_p_idx:].mean()
             last_p_bpb = avg_bpb_per_pos[last_p_idx:].mean()
 
+            out_d = {
+                'per_index_loss': avg_loss_per_pos.detach().cpu(),
+                'per_index_bpb': avg_bpb_per_pos.detach().cpu(),
+            }
+
+            if self.hparams.lb_dropout > 0.0 and self.hparams.split_bit:
+                # replace lower bit with mask token for input and target, run it on the model, and then get the loss for most significant bits only
+                mask_token = self.lb_mask_token
+                masked_input = input_tokens.clone()
+                masked_target = target_tokens.clone()
+                # replace every second token (the lower bits) with the mask token
+                masked_input[..., 1::2] = mask_token
+                masked_target[..., 0::2] = mask_token
+                # assert all tokens for msb are unchanged and < 256, and all tokens for lsb are mask token
+                assert torch.all(masked_input[..., ::2] == input_tokens[..., ::2])
+                assert torch.all(masked_input[..., 1::2] == mask_token)
+                assert torch.all(masked_target[..., ::2] == mask_token)
+                assert torch.all(masked_target[..., 1::2] == target_tokens[..., 1::2])
+                assert torch.all(masked_input[..., ::2] < 256), (input_tokens[..., ::2], masked_input[..., ::2])
+                assert torch.all(masked_target[..., 1::2] < 256), (target_tokens[..., 1::2], masked_target[..., 1::2])
+
+                masked_outputs = self(masked_input, labels=masked_target)
+                # masked_loss = masked_outputs.loss
+                # masked_bpb = masked_loss / np.log(2)
+                # extract only the loss for the most significant bits
+                shift_masked_logits = masked_outputs.logits[..., :-1, :].contiguous()
+                shift_masked_labels = masked_target[..., 1:].contiguous()
+                assert torch.all(shift_masked_labels[..., ::2] < 256)
+                assert torch.all(shift_masked_labels[..., 1::2] == mask_token)
+                masked_token_losses = loss_fct(shift_masked_logits.view(-1, shift_masked_logits.size(-1)), shift_masked_labels.view(-1))
+                masked_token_losses = masked_token_losses.view(shift_masked_labels.shape)
+                msb_token_losses = masked_token_losses[:, ::2]  # take only the losses for the most significant bits
+                masked_avg_loss = msb_token_losses.mean()
+                masked_avg_bpb = masked_avg_loss / np.log(2)
 
 
-        self.validation_outputs.append({
-            'per_index_loss': avg_loss_per_pos.detach().cpu(),
-            'per_index_bpb': avg_bpb_per_pos.detach().cpu(),
-        })
+                out_d['msb_loss'] = masked_avg_loss.detach().cpu()
+                out_d['msb_bpb'] = masked_avg_bpb.detach().cpu()
+
+        self.validation_outputs.append(out_d)
 
         return {
             'val_loss': loss.detach().cpu(),
@@ -358,6 +409,21 @@ class GPTAudioLightningModule(pl.LightningModule):
         # log loss/bit-per-byte
         mean_loss = float(mean_per_index_loss.mean())
         self.log('val/loss', mean_loss, on_epoch=True, prog_bar=True)
+
+        if self.hparams.get("lb_dropout", 0.0) > 0.0 and self.hparams.split_bit:
+            # also log the msb-only loss/bpb
+            msb_losses = []
+            msb_bpbs = []
+            for o in self.validation_outputs:
+                if 'msb_loss' in o and 'msb_bpb' in o:
+                    msb_losses.append(o['msb_loss'].numpy())
+                    msb_bpbs.append(o['msb_bpb'].numpy())
+            if len(msb_losses) > 0:
+                mean_msb_loss = np.stack(msb_losses, axis=0).mean()
+                mean_msb_bpb = np.stack(msb_bpbs, axis=0).mean()
+                self.log('val/msb_loss', float(mean_msb_loss), on_epoch=True, prog_bar=True)
+                self.log('val/msb_bpb', float(mean_msb_bpb), on_epoch=True, prog_bar=True)
+        self.validation_outputs = []  # reset for next epoch
     
 
     def _maybe_log_arrays_to_wandb(self, stage: str, per_index_loss_arr: np.ndarray, per_index_bpb_arr: np.ndarray, step: int):
@@ -538,7 +604,7 @@ class GPTAudioLightningModule(pl.LightningModule):
 # Data Module
 # =====================
 class MonoDataModule(pl.LightningDataModule):
-    def __init__(self, data_dir, batch_size=4, num_workers=4, chunk_size=1024, split_bit=False, only_lower_bits=False, train_p=1.0, stereo_interleave=False):
+    def __init__(self, data_dir, batch_size=4, num_workers=4, chunk_size=1024, split_bit=False, only_lower_bits=False, train_p=1.0, stereo_interleave=False, lb_dropout=0.0):
         super().__init__()
         self.data_dir = data_dir
         self.batch_size = batch_size
@@ -548,6 +614,7 @@ class MonoDataModule(pl.LightningDataModule):
         self.only_lower_bits = only_lower_bits
         self.train_p = train_p
         self.stereo_interleave = stereo_interleave
+        self.lb_dropout = lb_dropout
 
     def setup(self, stage=None):
         train_dir = os.path.join(self.data_dir, 'train')
@@ -555,8 +622,8 @@ class MonoDataModule(pl.LightningDataModule):
 
         # If explicit train/valid subdirectories exist, use them
         if os.path.isdir(train_dir) and os.path.isdir(valid_dir):
-            train_full = MonoWavChunkDataset(train_dir, chunk_size=self.chunk_size, bit_split=self.split_bit, only_lower_bits=self.only_lower_bits, stereo_interleave=self.stereo_interleave)
-            val_ds = MonoWavChunkDataset(valid_dir, chunk_size=self.chunk_size, bit_split=self.split_bit, only_lower_bits=self.only_lower_bits, stereo_interleave=self.stereo_interleave)
+            train_full = MonoWavChunkDataset(train_dir, chunk_size=self.chunk_size, bit_split=self.split_bit, only_lower_bits=self.only_lower_bits, stereo_interleave=self.stereo_interleave, lb_dropout=self.lb_dropout)
+            val_ds = MonoWavChunkDataset(valid_dir, chunk_size=self.chunk_size, bit_split=self.split_bit, only_lower_bits=self.only_lower_bits, stereo_interleave=self.stereo_interleave, lb_dropout=0.0)
 
             if self.train_p < 1.0:
                 n = len(train_full)
@@ -613,6 +680,8 @@ def main():
     parser.add_argument('--only_lower_bits', action='store_true', help='Whether to use only the lower 8 bits of 16-bit samples')
     parser.add_argument('--train_p', type=float, default=1.0, help='Proportion of training data to use')
     parser.add_argument('--stereo_interleave', action='store_true', help='Whether to interleave stereo channels')
+    parser.add_argument('--lb_dropout', type=float, default=0.0, help='Probability of dropping out lower bits when using bit-splitting')
+    parser.add_argument('--ckpt_path', type=str, default=None, help='Path to a checkpoint to resume from')
     args = parser.parse_args()
 
     # set seeds
@@ -621,7 +690,7 @@ def main():
     wandb_logger = WandbLogger(project=args.project)
 
     model = GPTAudioLightningModule(**vars(args))
-    dm = MonoDataModule(args.data_dir, batch_size=args.batch_size, chunk_size=args.chunk_size, split_bit=args.split_bit, only_lower_bits=args.only_lower_bits, train_p=args.train_p, stereo_interleave=args.stereo_interleave)
+    dm = MonoDataModule(args.data_dir, batch_size=args.batch_size, chunk_size=args.chunk_size, split_bit=args.split_bit, only_lower_bits=args.only_lower_bits, train_p=args.train_p, stereo_interleave=args.stereo_interleave, lb_dropout=args.lb_dropout)
 
 
     checkpoint_callback = ModelCheckpoint(
@@ -644,7 +713,7 @@ def main():
         log_every_n_steps=50,
     )
 
-    trainer.fit(model, datamodule=dm)
+    trainer.fit(model, datamodule=dm, ckpt_path=args.ckpt_path)
 
 
 if __name__ == '__main__':
