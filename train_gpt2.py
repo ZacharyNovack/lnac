@@ -160,10 +160,14 @@ class MonoWavChunkDataset(Dataset):
                 interleaved[wav.shape[1]:] = wav[0]
             wav = interleaved
         else:
-            if torch.rand(1).item() < 0.5:
-                wav = wav[1]  # take right channel only
+            # if stereo, randomly pick one channel
+            if wav.shape[0] == 2:
+                if torch.rand(1).item() < 0.5:
+                    wav = wav[1]  # take right channel only
+                else:
+                    wav = wav[0]  # take left channel only
             else:
-                wav = wav[0]  # take left channel only
+                wav = wav[0]  # mono
         # if bit_split is set, split each 16-bit value into two 8-bit values representing the high and low bytes
         if self.bit_split:
             splits = self.bit_split if type(self.bit_split) is int else 2
