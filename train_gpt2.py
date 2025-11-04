@@ -13,6 +13,7 @@ import os
 import random
 import json
 from tqdm import tqdm
+from typing import Optional, Tuple, Union, List
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -98,6 +99,43 @@ def q_zero(bits=8):
     The quantized level of the 0.0 value.
     """
     return 1 << (bits - 1)
+
+
+def quantize_unsigned_pcm_torch(x: torch.tensor, n_bits: int) -> torch.tensor:
+    if x.dtype != torch.float32:
+        raise ValueError("x must be float32")
+    if x.min() < -1 or x.max() > 1:
+        raise ValueError("x must be in range [-1, 1]")
+    if n_bits < 1 or n_bits > 64:
+        raise ValueError("n_bits must be between 1 and 64")
+
+    # Map from [-1, 1] to [0, 1)
+    x_normalized = (x + 1) / 2
+
+    # Scale by 2^n_bits (not 2^n_bits - 1) to maintain MSB invariance
+    scale = 2 ** n_bits
+    x_scaled = x_normalized * scale
+
+    # Use floor to convert to integer (not round, to maintain MSB invariance)
+    x_floored = torch.floor(x_scaled)
+
+    # Clamp to valid range [0, 2^n_bits - 1]
+    max_val = (2 ** n_bits) - 1
+    x_clamped = torch.clip(x_floored, 0, max_val)
+
+    return x_clamped.to(torch.int64)
+
+
+
+def msb_torch(x: torch.tensor, orig_n_bits: int, n_bits: int) -> torch.tensor:
+    # if x.dtype != torch.uint64:
+    #     raise ValueError("x must be uint64")
+    return (x >> (orig_n_bits - n_bits)) & ((1 << n_bits) - 1)
+
+def lsb_torch(x: torch.tensor, n_bits: int) -> torch.tensor:
+    # if x.dtype != torch.uint64:
+    #     raise ValueError("x must be uint64")
+    return x & ((1 << n_bits) - 1)
 
 
 # =====================
@@ -230,27 +268,153 @@ class MonoWavChunkDataset(Dataset):
         return input_tokens, target_tokens
 
 
+class TriloByteDataset(Dataset):
+
+    def __init__(self, data_dir: str, chunk_size: int = 4096, sample_rate: int = 44100, epoch_expansion_factor: int = 10, stereo_interleave: bool = False, lb_dropout: Union[float, List[float]] = 0.0, max_bit_depth: int = None, metadata_pth: Optional[str] = None):
+        self.files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.wav')]
+        self.chunk_size = chunk_size
+        self.sample_rate = sample_rate
+
+        self.epoch_expansion_factor = epoch_expansion_factor
+        self.stereo_interleave = stereo_interleave
+        self.lb_dropout = lb_dropout
+        self.max_bit_depth = max_bit_depth
+
+        # define mask token for lower bits dropout
+        match self.max_bit_depth:
+            case 24 | None:
+                self.lb_mask_token = 768
+            case 16:
+                self.lb_mask_token = 512
+            case 8:
+                self.lb_mask_token = 256
+
+        if len(self.files) == 0:
+            raise ValueError("files is empty")
+        print(f"TriloByteDataset: {len(self.files)} files, chunk_size={self.chunk_size}")
+        pth = metadata_pth.split('.')[0] + '_train.json' if 'train' in data_dir else metadata_pth.split('.')[0] + '_valid.json' if 'valid' in data_dir else metadata_pth
+        lengths = json.load(open(pth, 'r'))
+        for ix, f in enumerate(tqdm(self.files)):
+            self.files[ix] = (f, lengths[os.path.basename(f)])  # (path, num_samples)
+        self.files = self.files * self.epoch_expansion_factor
+        random.shuffle(self.files)
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        path, metadata = self.files[idx]
+        file_length = metadata['length']
+        # randomly sample a chunk of chunk_size from the file
+        chunk_size = self.chunk_size + 1
+        offset = torch.randint(0, max(1, file_length - chunk_size), (1,)).item()
+        wav, sr = torchaudio.load(path, normalize=True, frame_offset=offset, num_frames=chunk_size, backend="soundfile")
+        wav = quantize_unsigned_pcm_torch(wav, n_bits=self.max_bit_depth if self.max_bit_depth is not None else 24)
+
+        # randomly sample left or right channel
+        if self.stereo_interleave and wav.shape[0] == 2:
+            # put left, then right or right then left
+            interleaved = torch.zeros(wav.shape[1] * 2, dtype=wav.dtype)
+            if torch.rand(1).item() < 0.5:
+                interleaved[:wav.shape[1]] = wav[0]
+                interleaved[wav.shape[1]:] = wav[1]
+            else:
+                interleaved[:wav.shape[1]] = wav[1]
+                interleaved[wav.shape[1]:] = wav[0]
+            wav = interleaved
+        else:
+            # if stereo, randomly pick one channel
+            if wav.shape[0] == 2:
+                if torch.rand(1).item() < 0.5:
+                    wav = wav[1]  # take right channel only
+                else:
+                    wav = wav[0]  # take left channel only
+            else:
+                wav = wav[0]  # mono
+        # split bits into 3 bytes if 24 bits, or 2 bytes if 16 bits, or 1 byte if 8 bits
+        if self.max_bit_depth == 24 or self.max_bit_depth is None:
+            bit1 = msb_torch(wav, orig_n_bits=24, n_bits=8)
+            bit2 = lsb_torch(msb_torch(wav, orig_n_bits=24, n_bits=16), n_bits=8)
+            bit3 = lsb_torch(wav, n_bits=8)
+            # if the original bit depth is 16 or 8, apply dropout to the lower bytes
+            if metadata['bit_depth'] == 16:
+                # drop bit3, since there is no bit3 in original signal
+                bit3 = torch.full_like(bit3, self.lb_mask_token)
+            elif metadata['bit_depth'] == 8:
+                # drop bit2 and bit3
+                bit2 = torch.full_like(bit2, self.lb_mask_token)
+                bit3 = torch.full_like(bit3, self.lb_mask_token)
+            # drop lower bytes with probability lb_dropout
+            if isinstance(self.lb_dropout, list):
+                if len(self.lb_dropout) != 2:
+                    raise ValueError("lb_dropout list must have length 2")
+                if torch.rand(1).item() < self.lb_dropout[0]:
+                    bit2 = torch.full_like(bit2, self.lb_mask_token)
+                if torch.rand(1).item() < self.lb_dropout[1]:
+                    bit3 = torch.full_like(bit3, self.lb_mask_token)
+            else:
+                if torch.rand(1).item() < self.lb_dropout:
+                    bit2 = torch.full_like(bit2, self.lb_mask_token)
+                if torch.rand(1).item() < self.lb_dropout:
+                    bit3 = torch.full_like(bit3, self.lb_mask_token)
+            wav = torch.stack([bit1, bit2, bit3], dim=1).view(-1)
+        elif self.max_bit_depth == 16:
+            bit1 = msb_torch(wav, orig_n_bits=16, n_bits=8)
+            bit2 = lsb_torch(wav, n_bits=8)
+            # if the original bit depth is 8, apply dropout to the lower byte
+            if metadata['bit_depth'] == 8:
+                # drop bit2, since there is no bit2 in original signal
+                bit2 = torch.full_like(bit2, self.lb_mask_token)
+            # drop lower byte with probability lb_dropout
+            if torch.rand(1).item() < self.lb_dropout:
+                bit2 = torch.full_like(bit2, self.lb_mask_token)
+            wav = torch.stack([bit1, bit2], dim=1).view(-1)
+        elif self.max_bit_depth == 8:
+            bit1 = lsb_torch(wav, n_bits=8)
+            wav = bit1
+
+        if sr != self.sample_rate:
+            wav = torchaudio.functional.resample(wav, sr, self.sample_rate)
+        if len(wav) < self.chunk_size+1:
+            wav = torch.nn.functional.pad(wav, (0, self.chunk_size+1 - len(wav)), mode='constant', value=q_zero(bits=8))
+
+        seq_len = self.chunk_size * (self.max_bit_depth // 8 if self.max_bit_depth is not None else 3) * (2 if self.stereo_interleave else 1)
+        seq_len = min(seq_len + 1, len(wav))
+        tokens = wav[:seq_len]
+        input_tokens = tokens[:-1]
+        target_tokens = tokens[1:]
+        return input_tokens, target_tokens
+
+
+
 # =====================
 # Lightning Module
 # =====================
 class GPTAudioLightningModule(pl.LightningModule):
-    def __init__(self, model_name='gpt2', use_lora=False, lora_r=8, lora_alpha=32, lora_dropout=0.1, lora_target_modules='c_attn', lr=3e-4, weight_decay=0.1, warmup_steps=1000, max_steps=-1, min_lr=1e-5, log_last_p=0.5, split_bit=False, only_lower_bits=False, **kwargs):
+    def __init__(self, model_name='gpt2', use_lora=False, lora_r=8, lora_alpha=32, lora_dropout=0.1, lora_target_modules='c_attn', lr=3e-4, weight_decay=0.1, warmup_steps=1000, max_steps=-1, min_lr=1e-5, log_last_p=0.5, max_bit_depth=None, **kwargs):
         super().__init__()
         self.save_hyperparameters()
 
         config = GPT2Config.from_pretrained(model_name)
-        if split_bit == 2:
-            config.vocab_size = 512  # 256 high bits + 256 low bits
-        elif split_bit == 4:
-            config.vocab_size = 64  # 16 + 16 + 16 + 16
-        elif split_bit == 3:
-            config.vocab_size = 288  # 256 + 16 + 16
-        elif only_lower_bits:
-            config.vocab_size = 256  # only low 8 bits
-        else:
-            config.vocab_size = 65536  # 16-bit tokens
+        # if split_bit == 2:
+        #     config.vocab_size = 512  # 256 high bits + 256 low bits
+        # elif split_bit == 4:
+        #     config.vocab_size = 64  # 16 + 16 + 16 + 16
+        # elif split_bit == 3:
+        #     config.vocab_size = 288  # 256 + 16 + 16
+        # elif only_lower_bits:
+        #     config.vocab_size = 256  # only low 8 bits
+        # else:
+        #     config.vocab_size = 65536  # 16-bit tokens
+        match max_bit_depth:
+            case 24 | None:
+                config.vocab_size = 768  # 256 + 256 + 256
+            case 16:
+                config.vocab_size = 512  # 256 + 256
+            case 8:
+                config.vocab_size = 256  # 256
 
-        if kwargs.get("lb_dropout", 0.0) > 0.0 and split_bit:
+        if kwargs.get("lb_dropout", 0.0) > 0.0:
             config.vocab_size += 1  # add mask token for lower bits dropout
             self.lb_mask_token = config.vocab_size - 1
         config.max_position_embeddings = 2049
@@ -608,7 +772,7 @@ class GPTAudioLightningModule(pl.LightningModule):
 # Data Module
 # =====================
 class MonoDataModule(pl.LightningDataModule):
-    def __init__(self, data_dir, batch_size=4, num_workers=4, chunk_size=1024, split_bit=False, only_lower_bits=False, train_p=1.0, stereo_interleave=False, lb_dropout=0.0):
+    def __init__(self, data_dir, batch_size=4, num_workers=4, chunk_size=1024, split_bit=False, only_lower_bits=False, train_p=1.0, stereo_interleave=False, lb_dropout=0.0, epoch_expansion_factor=10):
         super().__init__()
         self.data_dir = data_dir
         self.batch_size = batch_size
@@ -619,6 +783,7 @@ class MonoDataModule(pl.LightningDataModule):
         self.train_p = train_p
         self.stereo_interleave = stereo_interleave
         self.lb_dropout = lb_dropout
+        self.epoch_expansion_factor = epoch_expansion_factor
 
     def setup(self, stage=None):
         train_dir = os.path.join(self.data_dir, 'train')
@@ -626,8 +791,8 @@ class MonoDataModule(pl.LightningDataModule):
 
         # If explicit train/valid subdirectories exist, use them
         if os.path.isdir(train_dir) and os.path.isdir(valid_dir):
-            train_full = MonoWavChunkDataset(train_dir, chunk_size=self.chunk_size, bit_split=self.split_bit, only_lower_bits=self.only_lower_bits, stereo_interleave=self.stereo_interleave, lb_dropout=self.lb_dropout)
-            val_ds = MonoWavChunkDataset(valid_dir, chunk_size=self.chunk_size, bit_split=self.split_bit, only_lower_bits=self.only_lower_bits, stereo_interleave=self.stereo_interleave, lb_dropout=0.0)
+            train_full = MonoWavChunkDataset(train_dir, chunk_size=self.chunk_size, bit_split=self.split_bit, only_lower_bits=self.only_lower_bits, stereo_interleave=self.stereo_interleave, lb_dropout=self.lb_dropout, epoch_expansion_factor=self.epoch_expansion_factor)
+            val_ds = MonoWavChunkDataset(valid_dir, chunk_size=self.chunk_size, bit_split=self.split_bit, only_lower_bits=self.only_lower_bits, stereo_interleave=self.stereo_interleave, lb_dropout=0.0, epoch_expansion_factor=self.epoch_expansion_factor)
 
             if self.train_p < 1.0:
                 n = len(train_full)
@@ -643,10 +808,11 @@ class MonoDataModule(pl.LightningDataModule):
             self.val_ds = val_ds
         else:
             # Fallback: use single directory and split internally (original behavior)
-            dataset = MonoWavChunkDataset(self.data_dir, chunk_size=self.chunk_size, bit_split=self.split_bit, only_lower_bits=self.only_lower_bits, stereo_interleave=self.stereo_interleave)
+            dataset = MonoWavChunkDataset(self.data_dir, chunk_size=self.chunk_size, bit_split=self.split_bit, only_lower_bits=self.only_lower_bits, stereo_interleave=self.stereo_interleave, lb_dropout=self.lb_dropout, epoch_expansion_factor=self.epoch_expansion_factor)
             n = len(dataset)
             n_train = int(0.9 * n)
             self.train_ds, self.val_ds, _ = torch.utils.data.random_split(dataset, [int(n_train * self.train_p), n - n_train, n_train - int(n_train * self.train_p)])
+            self.val_ds.lb_dropout = 0.0  # no dropout for validation
 
     def train_dataloader(self):
         return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
@@ -686,6 +852,7 @@ def main():
     parser.add_argument('--stereo_interleave', action='store_true', help='Whether to interleave stereo channels')
     parser.add_argument('--lb_dropout', type=float, default=0.0, help='Probability of dropping out lower bits when using bit-splitting')
     parser.add_argument('--ckpt_path', type=str, default=None, help='Path to a checkpoint to resume from')
+    parser.add_argument('--epoch_expansion_factor', type=int, default=10, help='Factor to expand dataset size per epoch')
     args = parser.parse_args()
 
     # set seeds
