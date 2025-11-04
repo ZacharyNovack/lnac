@@ -225,9 +225,9 @@ class MonoWavChunkDataset(Dataset):
             seq_len *= 2
         seq_len = min(seq_len + 1, len(tokens))
         tokens = tokens[:seq_len]
-        input_tokens = tokens[:-1]
-        target_tokens = tokens[1:]
-        return input_tokens, target_tokens
+        # input_tokens = tokens
+        # target_tokens = tokens[1:]
+        return tokens
 
 
 # =====================
@@ -276,8 +276,8 @@ class GPTAudioLightningModule(pl.LightningModule):
         return self.model(input_ids, labels=labels)
 
     def training_step(self, batch, batch_idx):
-        input_tokens, target_tokens = batch
-        outputs = self(input_tokens, labels=target_tokens)
+        input_tokens = batch
+        outputs = self(input_tokens, labels=input_tokens)
         loss = outputs.loss
         logits = outputs.logits.detach()
         bpb = loss / np.log(2)
@@ -285,7 +285,7 @@ class GPTAudioLightningModule(pl.LightningModule):
         # Compute loss per index
         with torch.no_grad():
             shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = target_tokens[..., 1:].contiguous()
+            shift_labels = input_tokens[..., 1:].contiguous()
             loss_fct = nn.CrossEntropyLoss(reduction='none')
             token_losses = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
             token_losses = token_losses.view(shift_labels.shape)
@@ -309,8 +309,8 @@ class GPTAudioLightningModule(pl.LightningModule):
     
 
     def validation_step(self, batch, batch_idx):
-        input_tokens, target_tokens = batch
-        outputs = self(input_tokens, labels=target_tokens)
+        input_tokens = batch
+        outputs = self(input_tokens, labels=input_tokens)
         loss = outputs.loss
         logits = outputs.logits.detach()
         bpb = loss / np.log(2)
@@ -318,7 +318,7 @@ class GPTAudioLightningModule(pl.LightningModule):
         # Compute loss per index
         with torch.no_grad():
             shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = target_tokens[..., 1:].contiguous()
+            shift_labels = input_tokens[..., 1:].contiguous()
             loss_fct = nn.CrossEntropyLoss(reduction='none')
             token_losses = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
             token_losses = token_losses.view(shift_labels.shape)
@@ -338,29 +338,29 @@ class GPTAudioLightningModule(pl.LightningModule):
                 # replace lower bit with mask token for input and target, run it on the model, and then get the loss for most significant bits only
                 mask_token = self.lb_mask_token
                 masked_input = input_tokens.clone()
-                masked_target = target_tokens.clone()
+                masked_target = input_tokens.clone()
                 # replace every second token (the lower bits) with the mask token
                 masked_input[..., 1::2] = mask_token
-                masked_target[..., 0::2] = mask_token
-                # assert all tokens for msb are unchanged and < 256, and all tokens for lsb are mask token
-                assert torch.all(masked_input[..., ::2] == input_tokens[..., ::2])
-                assert torch.all(masked_input[..., 1::2] == mask_token)
-                assert torch.all(masked_target[..., ::2] == mask_token)
-                assert torch.all(masked_target[..., 1::2] == target_tokens[..., 1::2])
-                assert torch.all(masked_input[..., ::2] < 256), (input_tokens[..., ::2], masked_input[..., ::2])
-                assert torch.all(masked_target[..., 1::2] < 256), (target_tokens[..., 1::2], masked_target[..., 1::2])
+                # masked_target[..., 0::2] = mask_token
+                # # assert all tokens for msb are unchanged and < 256, and all tokens for lsb are mask token
+                # assert torch.all(masked_input[..., ::2] == input_tokens[..., ::2])
+                # assert torch.all(masked_input[..., 1::2] == mask_token)
+                # assert torch.all(masked_target[..., ::2] == mask_token)
+                # assert torch.all(masked_target[..., 1::2] == target_tokens[..., 1::2])
+                # assert torch.all(masked_input[..., ::2] < 256), (input_tokens[..., ::2], masked_input[..., ::2])
+                # assert torch.all(masked_target[..., 1::2] < 256), (target_tokens[..., 1::2], masked_target[..., 1::2])
 
-                masked_outputs = self(masked_input, labels=masked_target)
+                masked_outputs = self(masked_input, labels=masked_input)
                 # masked_loss = masked_outputs.loss
                 # masked_bpb = masked_loss / np.log(2)
                 # extract only the loss for the most significant bits
                 shift_masked_logits = masked_outputs.logits[..., :-1, :].contiguous()
-                shift_masked_labels = masked_target[..., 1:].contiguous()
-                assert torch.all(shift_masked_labels[..., ::2] < 256)
-                assert torch.all(shift_masked_labels[..., 1::2] == mask_token)
+                shift_masked_labels = masked_input[..., 1:].contiguous()
+                assert torch.all(shift_masked_labels[..., 1::2] < 256)
+                assert torch.all(shift_masked_labels[..., ::2] == mask_token)
                 masked_token_losses = loss_fct(shift_masked_logits.view(-1, shift_masked_logits.size(-1)), shift_masked_labels.view(-1))
                 masked_token_losses = masked_token_losses.view(shift_masked_labels.shape)
-                msb_token_losses = masked_token_losses[:, ::2]  # take only the losses for the most significant bits
+                msb_token_losses = masked_token_losses[:, 1::2]  # take only the losses for the most significant bits
                 masked_avg_loss = msb_token_losses.mean()
                 masked_avg_bpb = masked_avg_loss / np.log(2)
 
@@ -471,25 +471,25 @@ class GPTAudioLightningModule(pl.LightningModule):
                         fig = Figure(figsize=(8.29, 8.29), dpi=100, tight_layout=True)
                         canvas = FigureCanvasAgg(fig)
                         ax = fig.add_subplot(2, 2, 1)
-                        ax.plot(per_index_loss_arr[::2], label='Per-index Loss High Bits', color='C0')
+                        ax.plot(per_index_loss_arr[1::2], label='Per-index Loss High Bits', color='C0')
                         ax.set_title(f'{stage} Per-index Loss High Bits')
                         ax.set_xlabel('Index (sample)')
                         ax.set_ylabel('Loss (nats)')
                         ax.grid(True)
                         ax = fig.add_subplot(2, 2, 2)
-                        ax.plot(per_index_loss_arr[1::2], label='Per-index Loss Low Bits', color='C1')
+                        ax.plot(per_index_loss_arr[::2], label='Per-index Loss Low Bits', color='C1')
                         ax.set_title(f'{stage} Per-index Loss Low Bits')
                         ax.set_xlabel('Index (sample)')
                         ax.set_ylabel('Loss (nats)')
                         ax.grid(True)
                         ax = fig.add_subplot(2, 2, 3)
-                        ax.plot(per_index_bpb_arr[::2], label='Per-index Bits-per-byte High Bits', color='C2')
+                        ax.plot(per_index_bpb_arr[1::2], label='Per-index Bits-per-byte High Bits', color='C2')
                         ax.set_title(f'{stage} Per-index Bits-per-byte High Bits')
                         ax.set_xlabel('Index (sample)')
                         ax.set_ylabel('Bits-per-byte')
                         ax.grid(True)
                         ax = fig.add_subplot(2, 2, 4)
-                        ax.plot(per_index_bpb_arr[1::2], label='Per-index Bits-per-byte Low Bits', color='C3')
+                        ax.plot(per_index_bpb_arr[::2], label='Per-index Bits-per-byte Low Bits', color='C3')
                         ax.set_title(f'{stage} Per-index Bits-per-byte Low Bits')
                         ax.set_xlabel('Index (sample)')
                         ax.set_ylabel('Bits-per-byte')
