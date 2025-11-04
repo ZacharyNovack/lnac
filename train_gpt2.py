@@ -270,8 +270,8 @@ class MonoWavChunkDataset(Dataset):
 
 class TriloByteDataset(Dataset):
 
-    def __init__(self, data_dir: str, chunk_size: int = 4096, sample_rate: int = 44100, epoch_expansion_factor: int = 10, stereo_interleave: bool = False, lb_dropout: Union[float, List[float]] = 0.0, max_bit_depth: int = None, metadata_pth: Optional[str] = None):
-        self.files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.wav')]
+    def __init__(self, data_dir: str, chunk_size: int = 4096, sample_rate: int = 44100, epoch_expansion_factor: int = 10, stereo_interleave: bool = False, lb_dropout: Union[float, List[float]] = 0.0, max_bit_depth: int = None, metadata_path: Optional[str] = None):
+        self.files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.flac')]
         self.chunk_size = chunk_size
         self.sample_rate = sample_rate
 
@@ -292,10 +292,13 @@ class TriloByteDataset(Dataset):
         if len(self.files) == 0:
             raise ValueError("files is empty")
         print(f"TriloByteDataset: {len(self.files)} files, chunk_size={self.chunk_size}")
-        pth = metadata_pth.split('.')[0] + '_train.json' if 'train' in data_dir else metadata_pth.split('.')[0] + '_valid.json' if 'valid' in data_dir else metadata_pth
+        pth = metadata_path.split('.')[0] + '_train.json' if 'train' in data_dir else metadata_path.split('.')[0] + '_valid.json' if 'valid' in data_dir else metadata_path
         lengths = json.load(open(pth, 'r'))
         for ix, f in enumerate(tqdm(self.files)):
             self.files[ix] = (f, lengths[os.path.basename(f)])  # (path, num_samples)
+
+        # filter files for samples < chunk_size*10
+        self.files = [file for file in self.files if file[1]['length'] >= self.chunk_size * 10]
         self.files = self.files * self.epoch_expansion_factor
         random.shuffle(self.files)
 
@@ -337,10 +340,10 @@ class TriloByteDataset(Dataset):
             bit2 = lsb_torch(msb_torch(wav, orig_n_bits=24, n_bits=16), n_bits=8)
             bit3 = lsb_torch(wav, n_bits=8)
             # if the original bit depth is 16 or 8, apply dropout to the lower bytes
-            if metadata['bit_depth'] == 16:
+            if metadata['bits_per_sample'] == 16:
                 # drop bit3, since there is no bit3 in original signal
                 bit3 = torch.full_like(bit3, self.lb_mask_token)
-            elif metadata['bit_depth'] == 8:
+            elif metadata['bits_per_sample'] == 8:
                 # drop bit2 and bit3
                 bit2 = torch.full_like(bit2, self.lb_mask_token)
                 bit3 = torch.full_like(bit3, self.lb_mask_token)
@@ -350,19 +353,21 @@ class TriloByteDataset(Dataset):
                     raise ValueError("lb_dropout list must have length 2")
                 if torch.rand(1).item() < self.lb_dropout[0]:
                     bit2 = torch.full_like(bit2, self.lb_mask_token)
-                if torch.rand(1).item() < self.lb_dropout[1]:
+                    bit3 = torch.full_like(bit3, self.lb_mask_token)
+                elif torch.rand(1).item() < self.lb_dropout[1]:
                     bit3 = torch.full_like(bit3, self.lb_mask_token)
             else:
                 if torch.rand(1).item() < self.lb_dropout:
                     bit2 = torch.full_like(bit2, self.lb_mask_token)
-                if torch.rand(1).item() < self.lb_dropout:
+                    bit3 = torch.full_like(bit3, self.lb_mask_token)
+                elif torch.rand(1).item() < self.lb_dropout:
                     bit3 = torch.full_like(bit3, self.lb_mask_token)
             wav = torch.stack([bit1, bit2, bit3], dim=1).view(-1)
         elif self.max_bit_depth == 16:
             bit1 = msb_torch(wav, orig_n_bits=16, n_bits=8)
             bit2 = lsb_torch(wav, n_bits=8)
             # if the original bit depth is 8, apply dropout to the lower byte
-            if metadata['bit_depth'] == 8:
+            if metadata['bits_per_sample'] == 8:
                 # drop bit2, since there is no bit2 in original signal
                 bit2 = torch.full_like(bit2, self.lb_mask_token)
             # drop lower byte with probability lb_dropout
@@ -381,9 +386,9 @@ class TriloByteDataset(Dataset):
         seq_len = self.chunk_size * (self.max_bit_depth // 8 if self.max_bit_depth is not None else 3) * (2 if self.stereo_interleave else 1)
         seq_len = min(seq_len + 1, len(wav))
         tokens = wav[:seq_len]
-        input_tokens = tokens[:-1]
-        target_tokens = tokens[1:]
-        return input_tokens, target_tokens
+        # input_tokens = tokens[:-1]
+        # target_tokens = tokens[1:]
+        return tokens
 
 
 
@@ -498,39 +503,62 @@ class GPTAudioLightningModule(pl.LightningModule):
                 'per_index_bpb': avg_bpb_per_pos.detach().cpu(),
             }
 
-            if self.hparams.lb_dropout > 0.0 and self.hparams.split_bit:
+            if self.hparams.lb_dropout > 0.0 and (self.hparams.max_bit_depth is None or self.hparams.max_bit_depth > 8):
                 # replace lower bit with mask token for input and target, run it on the model, and then get the loss for most significant bits only
                 mask_token = self.lb_mask_token
                 masked_input = input_tokens.clone()
-                masked_target = input_tokens.clone()
-                # replace every second token (the lower bits) with the mask token
-                masked_input[..., 1::2] = mask_token
-                # masked_target[..., 0::2] = mask_token
-                # # assert all tokens for msb are unchanged and < 256, and all tokens for lsb are mask token
-                # assert torch.all(masked_input[..., ::2] == input_tokens[..., ::2])
-                # assert torch.all(masked_input[..., 1::2] == mask_token)
-                # assert torch.all(masked_target[..., ::2] == mask_token)
-                # assert torch.all(masked_target[..., 1::2] == target_tokens[..., 1::2])
-                # assert torch.all(masked_input[..., ::2] < 256), (input_tokens[..., ::2], masked_input[..., ::2])
-                # assert torch.all(masked_target[..., 1::2] < 256), (target_tokens[..., 1::2], masked_target[..., 1::2])
+                if self.hparams.max_bit_depth == 24 or self.hparams.max_bit_depth is None:
+                    # we're gonna do two passes here, one for dropping byte 2 and byte 3 (i.e. 8 bit), and one for dropping byte 3 only (i.e. 16 bit)
+                    masked_input_8b = masked_input.clone()
+                    masked_input_16b = masked_input.clone()
+                    # replace every second and third token (the lower bits) with the mask token
+                    masked_input_8b[..., 1::3] = mask_token
+                    masked_input_8b[..., 2::3] = mask_token
+                    # for 16 bit dropout, only replace every third token
+                    masked_input_16b[..., 2::3] = mask_token
+                    masked_outputs_8b = self(masked_input_8b, labels=masked_input_8b)
+                    shift_masked_logits_8b = masked_outputs_8b.logits[..., :-1, :].contiguous()
+                    shift_masked_labels_8b = masked_input_8b[..., 1:].contiguous()
+                    masked_token_losses_8b = loss_fct(shift_masked_logits_8b.view(-1, shift_masked_logits_8b.size(-1)), shift_masked_labels_8b.view(-1))
+                    masked_token_losses_8b = masked_token_losses_8b.view(shift_masked_labels_8b.shape)
+                    msb_token_losses_8b = masked_token_losses_8b[:, 0::3]  # take only the losses for the most significant bits
+                    masked_avg_loss_8b = msb_token_losses_8b.mean()
+                    masked_avg_bpb_8b = masked_avg_loss_8b / np.log(2)
+                    out_d['msb_loss_8b'] = masked_avg_loss_8b.detach().cpu()
+                    out_d['msb_bpb_8b'] = masked_avg_bpb_8b.detach().cpu()
 
-                masked_outputs = self(masked_input, labels=masked_input)
-                # masked_loss = masked_outputs.loss
-                # masked_bpb = masked_loss / np.log(2)
-                # extract only the loss for the most significant bits
-                shift_masked_logits = masked_outputs.logits[..., :-1, :].contiguous()
-                shift_masked_labels = masked_input[..., 1:].contiguous()
-                assert torch.all(shift_masked_labels[..., 1::2] < 256)
-                assert torch.all(shift_masked_labels[..., ::2] == mask_token)
-                masked_token_losses = loss_fct(shift_masked_logits.view(-1, shift_masked_logits.size(-1)), shift_masked_labels.view(-1))
-                masked_token_losses = masked_token_losses.view(shift_masked_labels.shape)
-                msb_token_losses = masked_token_losses[:, 1::2]  # take only the losses for the most significant bits
-                masked_avg_loss = msb_token_losses.mean()
-                masked_avg_bpb = masked_avg_loss / np.log(2)
+                    masked_outputs_16b = self(masked_input_16b, labels=masked_input_16b)
+                    shift_masked_logits_16b = masked_outputs_16b.logits[..., :-1, :].contiguous()
+                    shift_masked_labels_16b = masked_input_16b[..., 1:].contiguous()
+                    masked_token_losses_16b = loss_fct(shift_masked_logits_16b.view(-1, shift_masked_logits_16b.size(-1)), shift_masked_labels_16b.view(-1))
+                    masked_token_losses_16b = masked_token_losses_16b.view(shift_masked_labels_16b.shape)
+                    # take losses for byte1 and byte2 (i.e. most significant 16 bits)
+                    msb_token_losses_16b = torch.cat([masked_token_losses_16b[:, 0::3], masked_token_losses_16b[:, 1::3]], dim=1)
+                    masked_avg_loss_16b = msb_token_losses_16b.mean()
+                    masked_avg_bpb_16b = masked_avg_loss_16b / np.log(2)
+                    out_d['msb_loss_16b'] = masked_avg_loss_16b.detach().cpu()
+                    out_d['msb_bpb_16b'] = masked_avg_bpb_16b.detach().cpu()
 
 
-                out_d['msb_loss'] = masked_avg_loss.detach().cpu()
-                out_d['msb_bpb'] = masked_avg_bpb.detach().cpu()
+                # data is represented as 24bit 3byte, but with the byte3 always mask, so we want to get loss for only byte1 (i.e. 8 bit)
+                elif self.hparams.max_bit_depth == 16:
+                    masked_input_8b = masked_input.clone()
+                    masked_input_8b[..., 1::3] = mask_token
+                    # make sure the third byte is also masked
+                    assert torch.all(masked_input_8b[..., 2::3] == mask_token)
+                    
+                    masked_outputs_8b = self(masked_input_8b, labels=masked_input_8b)
+                    shift_masked_logits_8b = masked_outputs_8b.logits[..., :-1, :].contiguous()
+                    shift_masked_labels_8b = masked_input_8b[..., 1:].contiguous()
+                    masked_token_losses_8b = loss_fct(shift_masked_logits_8b.view(-1, shift_masked_logits_8b.size(-1)), shift_masked_labels_8b.view(-1))
+                    masked_token_losses_8b = masked_token_losses_8b.view(shift_masked_labels_8b.shape)
+                    msb_token_losses_8b = masked_token_losses_8b[:, 0::3]  
+                    masked_avg_loss_8b = msb_token_losses_8b.mean()
+                    masked_avg_bpb_8b = masked_avg_loss_8b / np.log(2)
+                    out_d['msb_loss_8b'] = masked_avg_loss_8b.detach().cpu()
+                    out_d['msb_bpb_8b'] = masked_avg_bpb_8b.detach().cpu()
+
+                    
 
         self.validation_outputs.append(out_d)
 
@@ -578,19 +606,55 @@ class GPTAudioLightningModule(pl.LightningModule):
         mean_loss = float(mean_per_index_loss.mean())
         self.log('val/loss', mean_loss, on_epoch=True, prog_bar=True)
 
-        if self.hparams.get("lb_dropout", 0.0) > 0.0 and self.hparams.split_bit:
+        if self.hparams.get("lb_dropout", 0.0) > 0.0 and (self.hparams.max_bit_depth is None or self.hparams.max_bit_depth > 8):
+            if self.hparams.max_bit_depth == 24 or self.hparams.max_bit_depth is None:
+                # log the msb-only loss/bpb for 8 bit dropout
+                msb_losses_8b = []
+                msb_bpbs_8b = []
+                msb_losses_16b = []
+                msb_bpbs_16b = []
+                for o in self.validation_outputs:
+                    if 'msb_loss_8b' in o and 'msb_bpb_8b' in o:
+                        msb_losses_8b.append(o['msb_loss_8b'].numpy())
+                        msb_bpbs_8b.append(o['msb_bpb_8b'].numpy())
+                    if 'msb_loss_16b' in o and 'msb_bpb_16b' in o:
+                        msb_losses_16b.append(o['msb_loss_16b'].numpy())
+                        msb_bpbs_16b.append(o['msb_bpb_16b'].numpy())
+                if len(msb_losses_8b) > 0:
+                    mean_msb_loss_8b = np.stack(msb_losses_8b, axis=0).mean()
+                    mean_msb_bpb_8b = np.stack(msb_bpbs_8b, axis=0).mean()
+                    self.log('val/msb_loss_8b', float(mean_msb_loss_8b), on_epoch=True, prog_bar=True)
+                    self.log('val/msb_bpb_8b', float(mean_msb_bpb_8b), on_epoch=True, prog_bar=True)
+                if len(msb_losses_16b) > 0:
+                    mean_msb_loss_16b = np.stack(msb_losses_16b, axis=0).mean()
+                    mean_msb_bpb_16b = np.stack(msb_bpbs_16b, axis=0).mean()
+                    self.log('val/msb_loss_16b', float(mean_msb_loss_16b), on_epoch=True, prog_bar=True)
+                    self.log('val/msb_bpb_16b', float(mean_msb_bpb_16b), on_epoch=True, prog_bar=True)
+            elif self.hparams.max_bit_depth == 16:
+                # log the msb-only loss/bpb for 8 bit dropout
+                msb_losses_8b = []
+                msb_bpbs_8b = []
+                for o in self.validation_outputs:
+                    if 'msb_loss_8b' in o and 'msb_bpb_8b' in o:
+                        msb_losses_8b.append(o['msb_loss_8b'].numpy())
+                        msb_bpbs_8b.append(o['msb_bpb_8b'].numpy())
+                if len(msb_losses_8b) > 0:
+                    mean_msb_loss_8b = np.stack(msb_losses_8b, axis=0).mean()
+                    mean_msb_bpb_8b = np.stack(msb_bpbs_8b, axis=0).mean()
+                    self.log('val/msb_loss_8b', float(mean_msb_loss_8b), on_epoch=True, prog_bar=True)
+                    self.log('val/msb_bpb_8b', float(mean_msb_bpb_8b), on_epoch=True, prog_bar=True)
             # also log the msb-only loss/bpb
-            msb_losses = []
-            msb_bpbs = []
-            for o in self.validation_outputs:
-                if 'msb_loss' in o and 'msb_bpb' in o:
-                    msb_losses.append(o['msb_loss'].numpy())
-                    msb_bpbs.append(o['msb_bpb'].numpy())
-            if len(msb_losses) > 0:
-                mean_msb_loss = np.stack(msb_losses, axis=0).mean()
-                mean_msb_bpb = np.stack(msb_bpbs, axis=0).mean()
-                self.log('val/msb_loss', float(mean_msb_loss), on_epoch=True, prog_bar=True)
-                self.log('val/msb_bpb', float(mean_msb_bpb), on_epoch=True, prog_bar=True)
+            # msb_losses = []
+            # msb_bpbs = []
+            # for o in self.validation_outputs:
+            #     if 'msb_loss' in o and 'msb_bpb' in o:
+            #         msb_losses.append(o['msb_loss'].numpy())
+            #         msb_bpbs.append(o['msb_bpb'].numpy())
+            # if len(msb_losses) > 0:
+            #     mean_msb_loss = np.stack(msb_losses, axis=0).mean()
+            #     mean_msb_bpb = np.stack(msb_bpbs, axis=0).mean()
+            #     self.log('val/msb_loss', float(mean_msb_loss), on_epoch=True, prog_bar=True)
+            #     self.log('val/msb_bpb', float(mean_msb_bpb), on_epoch=True, prog_bar=True)
         self.validation_outputs = []  # reset for next epoch
     
 
@@ -609,52 +673,49 @@ class GPTAudioLightningModule(pl.LightningModule):
                 #              f'{stage}/per_index_bpb_first20': per_index_bpb_arr[:20].tolist()}
                 #     exp.log(small, step=step)
                 # plot it as a line plot and log the image
-                if not self.hparams.split_bit:
-                    fig = Figure(figsize=(4.145, 8.29), dpi=100, tight_layout=True)
-                    canvas = FigureCanvasAgg(fig)
-                    ax = fig.add_subplot(2, 1, 1)
-                    ax.plot(per_index_loss_arr, label='Per-index Loss', color='C0')
-                    ax.set_title(f'{stage} Per-index Loss')
-                    ax.set_xlabel('Index (sample)')
-                    ax.set_ylabel('Loss (nats)')
-                    ax.grid(True)
-                    ax = fig.add_subplot(2, 1, 2)
-                    ax.plot(per_index_bpb_arr, label='Per-index Bits-per-byte', color='C1')
-                    ax.set_title(f'{stage} Per-index Bits-per-byte')
-                    ax.set_xlabel('Index (sample)')
-                    ax.set_ylabel('Bits-per-byte')
-                    ax.grid(True)
-                    plt.tight_layout()
-                    canvas.draw()
-                    rgba = np.asarray(canvas.buffer_rgba())
-                    im = Image.fromarray(rgba)
-                    exp.log({f'{stage}/per_index_plot': wandb.Image(im)}, step=step)
-                else:
+                # if not self.hparams.split_bit:
+                #     fig = Figure(figsize=(4.145, 8.29), dpi=100, tight_layout=True)
+                #     canvas = FigureCanvasAgg(fig)
+                #     ax = fig.add_subplot(2, 1, 1)
+                #     ax.plot(per_index_loss_arr, label='Per-index Loss', color='C0')
+                #     ax.set_title(f'{stage} Per-index Loss')
+                #     ax.set_xlabel('Index (sample)')
+                #     ax.set_ylabel('Loss (nats)')
+                #     ax.grid(True)
+                #     ax = fig.add_subplot(2, 1, 2)
+                #     ax.plot(per_index_bpb_arr, label='Per-index Bits-per-byte', color='C1')
+                #     ax.set_title(f'{stage} Per-index Bits-per-byte')
+                #     ax.set_xlabel('Index (sample)')
+                #     ax.set_ylabel('Bits-per-byte')
+                #     ax.grid(True)
+                #     plt.tight_layout()
+                #     canvas.draw()
+                #     rgba = np.asarray(canvas.buffer_rgba())
+                #     im = Image.fromarray(rgba)
+                #     exp.log({f'{stage}/per_index_plot': wandb.Image(im)}, step=step)
+                # else:
                     # plot 4 subplots: loss high bits, loss low bits, bpb high bits, bpb low bits
-                    if self.hparams.split_bit == 2 or self.hparams.split_bit == True:
+                match self.hparams.max_bit_depth:
+                    case 24 | None:
+                        # plot for 24bit (3 bytes), 16bit (2 bytes), and 8bit (1 byte)
+                        # plot bpb for each byte in a grid
                         fig = Figure(figsize=(8.29, 8.29), dpi=100, tight_layout=True)
                         canvas = FigureCanvasAgg(fig)
-                        ax = fig.add_subplot(2, 2, 1)
-                        ax.plot(per_index_loss_arr[1::2], label='Per-index Loss High Bits', color='C0')
-                        ax.set_title(f'{stage} Per-index Loss High Bits')
-                        ax.set_xlabel('Index (sample)')
-                        ax.set_ylabel('Loss (nats)')
-                        ax.grid(True)
-                        ax = fig.add_subplot(2, 2, 2)
-                        ax.plot(per_index_loss_arr[::2], label='Per-index Loss Low Bits', color='C1')
-                        ax.set_title(f'{stage} Per-index Loss Low Bits')
-                        ax.set_xlabel('Index (sample)')
-                        ax.set_ylabel('Loss (nats)')
-                        ax.grid(True)
-                        ax = fig.add_subplot(2, 2, 3)
-                        ax.plot(per_index_bpb_arr[1::2], label='Per-index Bits-per-byte High Bits', color='C2')
-                        ax.set_title(f'{stage} Per-index Bits-per-byte High Bits')
+                        ax = fig.add_subplot(3, 1, 1)
+                        ax.plot(per_index_bpb_arr[2::3], label='Per-index Bits-per-byte Byte 1 (MSB)', color='C0')
+                        ax.set_title(f'{stage} Per-index Bits-per-byte Byte 1 (MSB)')
                         ax.set_xlabel('Index (sample)')
                         ax.set_ylabel('Bits-per-byte')
                         ax.grid(True)
-                        ax = fig.add_subplot(2, 2, 4)
-                        ax.plot(per_index_bpb_arr[::2], label='Per-index Bits-per-byte Low Bits', color='C3')
-                        ax.set_title(f'{stage} Per-index Bits-per-byte Low Bits')
+                        ax = fig.add_subplot(3, 1, 2)
+                        ax.plot(per_index_bpb_arr[::3], label='Per-index Bits-per-byte Byte 2', color='C1')
+                        ax.set_title(f'{stage} Per-index Bits-per-byte Byte 2')
+                        ax.set_xlabel('Index (sample)')
+                        ax.set_ylabel('Bits-per-byte')
+                        ax.grid(True)
+                        ax = fig.add_subplot(3, 1, 3)
+                        ax.plot(per_index_bpb_arr[1::3], label='Per-index Bits-per-byte Byte 3 (LSB)', color='C2')
+                        ax.set_title(f'{stage} Per-index Bits-per-byte Byte 3 (LSB)')
                         ax.set_xlabel('Index (sample)')
                         ax.set_ylabel('Bits-per-byte')
                         ax.grid(True)
@@ -663,31 +724,19 @@ class GPTAudioLightningModule(pl.LightningModule):
                         rgba = np.asarray(canvas.buffer_rgba())
                         im = Image.fromarray(rgba)
                         exp.log({f'{stage}/per_index_plot': wandb.Image(im)}, step=step)
-                    elif self.hparams.split_bit == 4:
-                        # do 2x2 grid of only bpb plots, for each of the 4 bit positions
-                        fig = Figure(figsize=(8.29, 8.29), dpi=100, tight_layout=True)
+                    case 16:
+                        # plot bpb for each byte in a grid, only 16bit and 8bit
+                        fig = Figure(figsize=(6, 8.29), dpi=100, tight_layout=True)
                         canvas = FigureCanvasAgg(fig)
-                        ax = fig.add_subplot(2, 2, 1)
-                        ax.plot(per_index_bpb_arr[::4], label='Per-index Bits-per-byte Bit 3', color='C0')
-                        ax.set_title(f'{stage} Per-index Bits-per-byte Bit 3')
+                        ax = fig.add_subplot(2, 1, 1)
+                        ax.plot(per_index_bpb_arr[2::3], label='Per-index Bits-per-byte Byte 1 (MSB)', color='C0')
+                        ax.set_title(f'{stage} Per-index Bits-per-byte Byte 1 (MSB)')
                         ax.set_xlabel('Index (sample)')
                         ax.set_ylabel('Bits-per-byte')
                         ax.grid(True)
-                        ax = fig.add_subplot(2, 2, 2)
-                        ax.plot(per_index_bpb_arr[1::4], label='Per-index Bits-per-byte Bit 2', color='C1')
-                        ax.set_title(f'{stage} Per-index Bits-per-byte Bit 2')
-                        ax.set_xlabel('Index (sample)')
-                        ax.set_ylabel('Bits-per-byte')
-                        ax.grid(True)
-                        ax = fig.add_subplot(2, 2, 3)
-                        ax.plot(per_index_bpb_arr[2::4], label='Per-index Bits-per-byte Bit 1', color='C2')
-                        ax.set_title(f'{stage} Per-index Bits-per-byte Bit 1')
-                        ax.set_xlabel('Index (sample)')
-                        ax.set_ylabel('Bits-per-byte')
-                        ax.grid(True)
-                        ax = fig.add_subplot(2, 2, 4)
-                        ax.plot(per_index_bpb_arr[3::4], label='Per-index Bits-per-byte Bit 0', color='C3')
-                        ax.set_title(f'{stage} Per-index Bits-per-byte Bit 0')
+                        ax = fig.add_subplot(2, 1, 2)
+                        ax.plot(per_index_bpb_arr[::3], label='Per-index Bits-per-byte Byte 2 (LSB)', color='C1')
+                        ax.set_title(f'{stage} Per-index Bits-per-byte Byte 2 (LSB)')
                         ax.set_xlabel('Index (sample)')
                         ax.set_ylabel('Bits-per-byte')
                         ax.grid(True)
@@ -696,39 +745,106 @@ class GPTAudioLightningModule(pl.LightningModule):
                         rgba = np.asarray(canvas.buffer_rgba())
                         im = Image.fromarray(rgba)
                         exp.log({f'{stage}/per_index_plot': wandb.Image(im)}, step=step)
-                    elif self.hparams.split_bit == 3:
-                        # do first plot for 8-bit part, second plot for 4-bit part, third plot for last 4-bit part, and then 4th plot for all combined
-                        fig = Figure(figsize=(8.29, 8.29), dpi=100, tight_layout=True)
-                        canvas = FigureCanvasAgg(fig)
-                        ax = fig.add_subplot(2, 2, 1)
-                        ax.plot(per_index_bpb_arr[::3], label='Per-index Bits-per-byte Big 8-bit Part', color='C0')
-                        ax.set_title(f'{stage} Per-index Bits-per-byte Big 8-bit Part')
-                        ax.set_xlabel('Index (sample)')
-                        ax.set_ylabel('Bits-per-byte')
-                        ax.grid(True)
-                        ax = fig.add_subplot(2, 2, 2)
-                        ax.plot(per_index_bpb_arr[1::3], label='Per-index Bits-per-byte Middle 4-bit Part', color='C1')
-                        ax.set_title(f'{stage} Per-index Bits-per-byte Middle 4-bit Part')
-                        ax.set_xlabel('Index (sample)')
-                        ax.set_ylabel('Bits-per-byte')
-                        ax.grid(True)
-                        ax = fig.add_subplot(2, 2, 3)
-                        ax.plot(per_index_bpb_arr[2::3], label='Per-index Bits-per-byte Smallest 4-bit Part', color='C2')
-                        ax.set_title(f'{stage} Per-index Bits-per-byte Smallest 4-bit Part')
-                        ax.set_xlabel('Index (sample)')
-                        ax.set_ylabel('Bits-per-byte')
-                        ax.grid(True)
-                        ax = fig.add_subplot(2, 2, 4)
-                        ax.plot(per_index_bpb_arr, label='Per-index Bits-per-byte All Combined', color='C3')
-                        ax.set_title(f'{stage} Per-index Bits-per-byte All Combined')
-                        ax.set_xlabel('Index (sample)')
-                        ax.set_ylabel('Bits-per-byte')
-                        ax.grid(True)
-                        plt.tight_layout()
-                        canvas.draw()
-                        rgba = np.asarray(canvas.buffer_rgba())
-                        im = Image.fromarray(rgba)
-                        exp.log({f'{stage}/per_index_plot': wandb.Image(im)}, step=step)
+                    case 8:
+                        pass
+                    # if self.hparams.split_bit == 2 or self.hparams.split_bit == True:
+                    #     fig = Figure(figsize=(8.29, 8.29), dpi=100, tight_layout=True)
+                    #     canvas = FigureCanvasAgg(fig)
+                    #     ax = fig.add_subplot(2, 2, 1)
+                    #     ax.plot(per_index_loss_arr[1::2], label='Per-index Loss High Bits', color='C0')
+                    #     ax.set_title(f'{stage} Per-index Loss High Bits')
+                    #     ax.set_xlabel('Index (sample)')
+                    #     ax.set_ylabel('Loss (nats)')
+                    #     ax.grid(True)
+                    #     ax = fig.add_subplot(2, 2, 2)
+                    #     ax.plot(per_index_loss_arr[::2], label='Per-index Loss Low Bits', color='C1')
+                    #     ax.set_title(f'{stage} Per-index Loss Low Bits')
+                    #     ax.set_xlabel('Index (sample)')
+                    #     ax.set_ylabel('Loss (nats)')
+                    #     ax.grid(True)
+                    #     ax = fig.add_subplot(2, 2, 3)
+                    #     ax.plot(per_index_bpb_arr[1::2], label='Per-index Bits-per-byte High Bits', color='C2')
+                    #     ax.set_title(f'{stage} Per-index Bits-per-byte High Bits')
+                    #     ax.set_xlabel('Index (sample)')
+                    #     ax.set_ylabel('Bits-per-byte')
+                    #     ax.grid(True)
+                    #     ax = fig.add_subplot(2, 2, 4)
+                    #     ax.plot(per_index_bpb_arr[::2], label='Per-index Bits-per-byte Low Bits', color='C3')
+                    #     ax.set_title(f'{stage} Per-index Bits-per-byte Low Bits')
+                    #     ax.set_xlabel('Index (sample)')
+                    #     ax.set_ylabel('Bits-per-byte')
+                    #     ax.grid(True)
+                    #     plt.tight_layout()
+                    #     canvas.draw()
+                    #     rgba = np.asarray(canvas.buffer_rgba())
+                    #     im = Image.fromarray(rgba)
+                    #     exp.log({f'{stage}/per_index_plot': wandb.Image(im)}, step=step)
+                    # elif self.hparams.split_bit == 4:
+                    #     # do 2x2 grid of only bpb plots, for each of the 4 bit positions
+                    #     fig = Figure(figsize=(8.29, 8.29), dpi=100, tight_layout=True)
+                    #     canvas = FigureCanvasAgg(fig)
+                    #     ax = fig.add_subplot(2, 2, 1)
+                    #     ax.plot(per_index_bpb_arr[::4], label='Per-index Bits-per-byte Bit 3', color='C0')
+                    #     ax.set_title(f'{stage} Per-index Bits-per-byte Bit 3')
+                    #     ax.set_xlabel('Index (sample)')
+                    #     ax.set_ylabel('Bits-per-byte')
+                    #     ax.grid(True)
+                    #     ax = fig.add_subplot(2, 2, 2)
+                    #     ax.plot(per_index_bpb_arr[1::4], label='Per-index Bits-per-byte Bit 2', color='C1')
+                    #     ax.set_title(f'{stage} Per-index Bits-per-byte Bit 2')
+                    #     ax.set_xlabel('Index (sample)')
+                    #     ax.set_ylabel('Bits-per-byte')
+                    #     ax.grid(True)
+                    #     ax = fig.add_subplot(2, 2, 3)
+                    #     ax.plot(per_index_bpb_arr[2::4], label='Per-index Bits-per-byte Bit 1', color='C2')
+                    #     ax.set_title(f'{stage} Per-index Bits-per-byte Bit 1')
+                    #     ax.set_xlabel('Index (sample)')
+                    #     ax.set_ylabel('Bits-per-byte')
+                    #     ax.grid(True)
+                    #     ax = fig.add_subplot(2, 2, 4)
+                    #     ax.plot(per_index_bpb_arr[3::4], label='Per-index Bits-per-byte Bit 0', color='C3')
+                    #     ax.set_title(f'{stage} Per-index Bits-per-byte Bit 0')
+                    #     ax.set_xlabel('Index (sample)')
+                    #     ax.set_ylabel('Bits-per-byte')
+                    #     ax.grid(True)
+                    #     plt.tight_layout()
+                    #     canvas.draw()
+                    #     rgba = np.asarray(canvas.buffer_rgba())
+                    #     im = Image.fromarray(rgba)
+                    #     exp.log({f'{stage}/per_index_plot': wandb.Image(im)}, step=step)
+                    # elif self.hparams.split_bit == 3:
+                    #     # do first plot for 8-bit part, second plot for 4-bit part, third plot for last 4-bit part, and then 4th plot for all combined
+                    #     fig = Figure(figsize=(8.29, 8.29), dpi=100, tight_layout=True)
+                    #     canvas = FigureCanvasAgg(fig)
+                    #     ax = fig.add_subplot(2, 2, 1)
+                    #     ax.plot(per_index_bpb_arr[::3], label='Per-index Bits-per-byte Big 8-bit Part', color='C0')
+                    #     ax.set_title(f'{stage} Per-index Bits-per-byte Big 8-bit Part')
+                    #     ax.set_xlabel('Index (sample)')
+                    #     ax.set_ylabel('Bits-per-byte')
+                    #     ax.grid(True)
+                    #     ax = fig.add_subplot(2, 2, 2)
+                    #     ax.plot(per_index_bpb_arr[1::3], label='Per-index Bits-per-byte Middle 4-bit Part', color='C1')
+                    #     ax.set_title(f'{stage} Per-index Bits-per-byte Middle 4-bit Part')
+                    #     ax.set_xlabel('Index (sample)')
+                    #     ax.set_ylabel('Bits-per-byte')
+                    #     ax.grid(True)
+                    #     ax = fig.add_subplot(2, 2, 3)
+                    #     ax.plot(per_index_bpb_arr[2::3], label='Per-index Bits-per-byte Smallest 4-bit Part', color='C2')
+                    #     ax.set_title(f'{stage} Per-index Bits-per-byte Smallest 4-bit Part')
+                    #     ax.set_xlabel('Index (sample)')
+                    #     ax.set_ylabel('Bits-per-byte')
+                    #     ax.grid(True)
+                    #     ax = fig.add_subplot(2, 2, 4)
+                    #     ax.plot(per_index_bpb_arr, label='Per-index Bits-per-byte All Combined', color='C3')
+                    #     ax.set_title(f'{stage} Per-index Bits-per-byte All Combined')
+                    #     ax.set_xlabel('Index (sample)')
+                    #     ax.set_ylabel('Bits-per-byte')
+                    #     ax.grid(True)
+                    #     plt.tight_layout()
+                    #     canvas.draw()
+                    #     rgba = np.asarray(canvas.buffer_rgba())
+                    #     im = Image.fromarray(rgba)
+                    #     exp.log({f'{stage}/per_index_plot': wandb.Image(im)}, step=step)
 
 
             else:
@@ -772,18 +888,21 @@ class GPTAudioLightningModule(pl.LightningModule):
 # Data Module
 # =====================
 class MonoDataModule(pl.LightningDataModule):
-    def __init__(self, data_dir, batch_size=4, num_workers=4, chunk_size=1024, split_bit=False, only_lower_bits=False, train_p=1.0, stereo_interleave=False, lb_dropout=0.0, epoch_expansion_factor=10):
+    def __init__(self, data_dir, batch_size=4, num_workers=4, chunk_size=1024, sample_rate=44100, split_bit=False, only_lower_bits=False, train_p=1.0, stereo_interleave=False, lb_dropout=0.0, epoch_expansion_factor=10, max_bit_depth=None, metadata_path=None):
         super().__init__()
         self.data_dir = data_dir
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.chunk_size = chunk_size
+        self.sample_rate = sample_rate
         self.split_bit = split_bit
         self.only_lower_bits = only_lower_bits
         self.train_p = train_p
         self.stereo_interleave = stereo_interleave
         self.lb_dropout = lb_dropout
         self.epoch_expansion_factor = epoch_expansion_factor
+        self.max_bit_depth = max_bit_depth
+        self.metadata_path = metadata_path
 
     def setup(self, stage=None):
         train_dir = os.path.join(self.data_dir, 'train')
@@ -791,8 +910,10 @@ class MonoDataModule(pl.LightningDataModule):
 
         # If explicit train/valid subdirectories exist, use them
         if os.path.isdir(train_dir) and os.path.isdir(valid_dir):
-            train_full = MonoWavChunkDataset(train_dir, chunk_size=self.chunk_size, bit_split=self.split_bit, only_lower_bits=self.only_lower_bits, stereo_interleave=self.stereo_interleave, lb_dropout=self.lb_dropout, epoch_expansion_factor=self.epoch_expansion_factor)
-            val_ds = MonoWavChunkDataset(valid_dir, chunk_size=self.chunk_size, bit_split=self.split_bit, only_lower_bits=self.only_lower_bits, stereo_interleave=self.stereo_interleave, lb_dropout=0.0, epoch_expansion_factor=self.epoch_expansion_factor)
+            # train_full = MonoWavChunkDataset(train_dir, chunk_size=self.chunk_size, bit_split=self.split_bit, only_lower_bits=self.only_lower_bits, stereo_interleave=self.stereo_interleave, lb_dropout=self.lb_dropout, epoch_expansion_factor=self.epoch_expansion_factor)
+            # val_ds = MonoWavChunkDataset(valid_dir, chunk_size=self.chunk_size, bit_split=self.split_bit, only_lower_bits=self.only_lower_bits, stereo_interleave=self.stereo_interleave, lb_dropout=0.0, epoch_expansion_factor=self.epoch_expansion_factor)
+            train_full = TriloByteDataset(train_dir, chunk_size=self.chunk_size, sample_rate=self.sample_rate, stereo_interleave=self.stereo_interleave, lb_dropout=self.lb_dropout, epoch_expansion_factor=self.epoch_expansion_factor, max_bit_depth=self.max_bit_depth, metadata_path=self.metadata_path)
+            val_ds = TriloByteDataset(valid_dir, chunk_size=self.chunk_size, sample_rate=self.sample_rate, stereo_interleave=self.stereo_interleave, lb_dropout=0.0, epoch_expansion_factor=self.epoch_expansion_factor, max_bit_depth=self.max_bit_depth, metadata_path=self.metadata_path)
 
             if self.train_p < 1.0:
                 n = len(train_full)
@@ -808,7 +929,7 @@ class MonoDataModule(pl.LightningDataModule):
             self.val_ds = val_ds
         else:
             # Fallback: use single directory and split internally (original behavior)
-            dataset = MonoWavChunkDataset(self.data_dir, chunk_size=self.chunk_size, bit_split=self.split_bit, only_lower_bits=self.only_lower_bits, stereo_interleave=self.stereo_interleave, lb_dropout=self.lb_dropout, epoch_expansion_factor=self.epoch_expansion_factor)
+            dataset = TriloByteDataset(self.data_dir, chunk_size=self.chunk_size, sample_rate=self.sample_rate, stereo_interleave=self.stereo_interleave, lb_dropout=self.lb_dropout, epoch_expansion_factor=self.epoch_expansion_factor, max_bit_depth=self.max_bit_depth, metadata_path=self.metadata_path)
             n = len(dataset)
             n_train = int(0.9 * n)
             self.train_ds, self.val_ds, _ = torch.utils.data.random_split(dataset, [int(n_train * self.train_p), n - n_train, n_train - int(n_train * self.train_p)])
@@ -833,6 +954,7 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--model_name', type=str, default='gpt2')
     parser.add_argument('--chunk_size', type=int, default=1024)
+    parser.add_argument('--sample_rate', type=int, default=44100)
     parser.add_argument('--max_epochs', type=int, default=-1)
     parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--weight_decay', type=float, default=0.1)
@@ -852,7 +974,9 @@ def main():
     parser.add_argument('--stereo_interleave', action='store_true', help='Whether to interleave stereo channels')
     parser.add_argument('--lb_dropout', type=float, default=0.0, help='Probability of dropping out lower bits when using bit-splitting')
     parser.add_argument('--ckpt_path', type=str, default=None, help='Path to a checkpoint to resume from')
-    parser.add_argument('--epoch_expansion_factor', type=int, default=10, help='Factor to expand dataset size per epoch')
+    parser.add_argument('--epoch_expansion_factor', type=int, default=1, help='Factor to expand dataset size per epoch')
+    parser.add_argument('--max_bit_depth', type=int, default=None, help='Maximum bit depth of audio data (8, 16, or 24). If not set, infer from data.')
+    parser.add_argument('--metadata_path', type=str, default=None, help='Path to metadata file for the dataset (if any)')
     args = parser.parse_args()
 
     # set seeds
@@ -861,7 +985,7 @@ def main():
     wandb_logger = WandbLogger(project=args.project)
 
     model = GPTAudioLightningModule(**vars(args))
-    dm = MonoDataModule(args.data_dir, batch_size=args.batch_size, chunk_size=args.chunk_size, split_bit=args.split_bit, only_lower_bits=args.only_lower_bits, train_p=args.train_p, stereo_interleave=args.stereo_interleave, lb_dropout=args.lb_dropout)
+    dm = MonoDataModule(args.data_dir, batch_size=args.batch_size, chunk_size=args.chunk_size, sample_rate=args.sample_rate, split_bit=args.split_bit, only_lower_bits=args.only_lower_bits, train_p=args.train_p, stereo_interleave=args.stereo_interleave, lb_dropout=args.lb_dropout, epoch_expansion_factor=args.epoch_expansion_factor, max_bit_depth=args.max_bit_depth, metadata_path=args.metadata_path)
 
 
     checkpoint_callback = ModelCheckpoint(
