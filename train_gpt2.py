@@ -139,7 +139,7 @@ def lsb_torch(x: torch.tensor, n_bits: int) -> torch.tensor:
 
 
 # =====================
-# Dataset for Mono Audio
+# Dataset for Audio (o.g. implementation TODO: deprecated, remove this)
 # =====================
 class MonoWavChunkDataset(Dataset):
     def __init__(self, data_dir, chunk_size=4096, sample_rate=44100, bit_split=False, epoch_expansion_factor=10, only_lower_bits=False, stereo_interleave=False, lb_dropout=0.0):
@@ -271,7 +271,7 @@ class MonoWavChunkDataset(Dataset):
 class TriloByteDataset(Dataset):
 
     def __init__(self, data_dir: str, chunk_size: int = 4096, sample_rate: int = 44100, epoch_expansion_factor: int = 10, stereo_interleave: bool = False, lb_dropout: Union[float, List[float]] = 0.0, max_bit_depth: int = None, metadata_path: Optional[str] = None):
-        self.files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.flac')]
+        self.files = sorted(os.path.join(root, f) for root, _, files in os.walk(data_dir) for f in files if (f.endswith('.flac') or f.endswith('.wav')))
         self.chunk_size = chunk_size
         self.sample_rate = sample_rate
 
@@ -292,8 +292,8 @@ class TriloByteDataset(Dataset):
         if len(self.files) == 0:
             raise ValueError("files is empty")
         print(f"TriloByteDataset: {len(self.files)} files, chunk_size={self.chunk_size}")
-        pth = metadata_path.split('.')[0] + '_train.json' if 'train' in data_dir else metadata_path.split('.')[0] + '_valid.json' if 'valid' in data_dir else metadata_path
-        lengths = json.load(open(pth, 'r'))
+        # pth = metadata_path.split('.')[0] + '_train.json' if 'train' in data_dir else metadata_path.split('.')[0] + '_valid.json' if 'valid' in data_dir else metadata_path
+        lengths = json.load(open(metadata_path, 'r'))
         for ix, f in enumerate(tqdm(self.files)):
             self.files[ix] = (f, lengths[os.path.basename(f)])  # (path, num_samples)
 
@@ -379,8 +379,10 @@ class TriloByteDataset(Dataset):
             wav = bit1
 
         if sr != self.sample_rate:
+            print(f"Resampling from {sr} to {self.sample_rate}")
             wav = torchaudio.functional.resample(wav, sr, self.sample_rate)
         if len(wav) < self.chunk_size+1:
+            print(f"Padding audio from {len(wav)} to {self.chunk_size+1}")
             wav = torch.nn.functional.pad(wav, (0, self.chunk_size+1 - len(wav)), mode='constant', value=q_zero(bits=8))
 
         seq_len = self.chunk_size * (self.max_bit_depth // 8 if self.max_bit_depth is not None else 3) * (2 if self.stereo_interleave else 1)
@@ -521,7 +523,7 @@ class GPTAudioLightningModule(pl.LightningModule):
                     shift_masked_labels_8b = masked_input_8b[..., 1:].contiguous()
                     masked_token_losses_8b = loss_fct(shift_masked_logits_8b.view(-1, shift_masked_logits_8b.size(-1)), shift_masked_labels_8b.view(-1))
                     masked_token_losses_8b = masked_token_losses_8b.view(shift_masked_labels_8b.shape)
-                    msb_token_losses_8b = masked_token_losses_8b[:, 0::3]  # take only the losses for the most significant bits
+                    msb_token_losses_8b = masked_token_losses_8b[:, 2::3]  # take only the losses for the most significant bits
                     masked_avg_loss_8b = msb_token_losses_8b.mean()
                     masked_avg_bpb_8b = masked_avg_loss_8b / np.log(2)
                     out_d['msb_loss_8b'] = masked_avg_loss_8b.detach().cpu()
@@ -533,26 +535,24 @@ class GPTAudioLightningModule(pl.LightningModule):
                     masked_token_losses_16b = loss_fct(shift_masked_logits_16b.view(-1, shift_masked_logits_16b.size(-1)), shift_masked_labels_16b.view(-1))
                     masked_token_losses_16b = masked_token_losses_16b.view(shift_masked_labels_16b.shape)
                     # take losses for byte1 and byte2 (i.e. most significant 16 bits)
-                    msb_token_losses_16b = torch.cat([masked_token_losses_16b[:, 0::3], masked_token_losses_16b[:, 1::3]], dim=1)
+                    msb_token_losses_16b = torch.cat([masked_token_losses_16b[:, 0::3], masked_token_losses_16b[:, 2::3]], dim=1)
                     masked_avg_loss_16b = msb_token_losses_16b.mean()
                     masked_avg_bpb_16b = masked_avg_loss_16b / np.log(2)
                     out_d['msb_loss_16b'] = masked_avg_loss_16b.detach().cpu()
                     out_d['msb_bpb_16b'] = masked_avg_bpb_16b.detach().cpu()
 
 
-                # data is represented as 24bit 3byte, but with the byte3 always mask, so we want to get loss for only byte1 (i.e. 8 bit)
+                # data is represented as 2 bytes per sample
                 elif self.hparams.max_bit_depth == 16:
                     masked_input_8b = masked_input.clone()
-                    masked_input_8b[..., 1::3] = mask_token
-                    # make sure the third byte is also masked
-                    assert torch.all(masked_input_8b[..., 2::3] == mask_token)
+                    masked_input_8b[..., 1::2] = mask_token
                     
                     masked_outputs_8b = self(masked_input_8b, labels=masked_input_8b)
                     shift_masked_logits_8b = masked_outputs_8b.logits[..., :-1, :].contiguous()
                     shift_masked_labels_8b = masked_input_8b[..., 1:].contiguous()
                     masked_token_losses_8b = loss_fct(shift_masked_logits_8b.view(-1, shift_masked_logits_8b.size(-1)), shift_masked_labels_8b.view(-1))
                     masked_token_losses_8b = masked_token_losses_8b.view(shift_masked_labels_8b.shape)
-                    msb_token_losses_8b = masked_token_losses_8b[:, 0::3]  
+                    msb_token_losses_8b = masked_token_losses_8b[:, 1::2]
                     masked_avg_loss_8b = msb_token_losses_8b.mean()
                     masked_avg_bpb_8b = masked_avg_loss_8b / np.log(2)
                     out_d['msb_loss_8b'] = masked_avg_loss_8b.detach().cpu()
@@ -729,13 +729,13 @@ class GPTAudioLightningModule(pl.LightningModule):
                         fig = Figure(figsize=(6, 8.29), dpi=100, tight_layout=True)
                         canvas = FigureCanvasAgg(fig)
                         ax = fig.add_subplot(2, 1, 1)
-                        ax.plot(per_index_bpb_arr[2::3], label='Per-index Bits-per-byte Byte 1 (MSB)', color='C0')
+                        ax.plot(per_index_bpb_arr[1::2], label='Per-index Bits-per-byte Byte 1 (MSB)', color='C0')
                         ax.set_title(f'{stage} Per-index Bits-per-byte Byte 1 (MSB)')
                         ax.set_xlabel('Index (sample)')
                         ax.set_ylabel('Bits-per-byte')
                         ax.grid(True)
                         ax = fig.add_subplot(2, 1, 2)
-                        ax.plot(per_index_bpb_arr[::3], label='Per-index Bits-per-byte Byte 2 (LSB)', color='C1')
+                        ax.plot(per_index_bpb_arr[::2], label='Per-index Bits-per-byte Byte 2 (LSB)', color='C1')
                         ax.set_title(f'{stage} Per-index Bits-per-byte Byte 2 (LSB)')
                         ax.set_xlabel('Index (sample)')
                         ax.set_ylabel('Bits-per-byte')
@@ -888,9 +888,10 @@ class GPTAudioLightningModule(pl.LightningModule):
 # Data Module
 # =====================
 class MonoDataModule(pl.LightningDataModule):
-    def __init__(self, data_dir, batch_size=4, num_workers=4, chunk_size=1024, sample_rate=44100, split_bit=False, only_lower_bits=False, train_p=1.0, stereo_interleave=False, lb_dropout=0.0, epoch_expansion_factor=10, max_bit_depth=None, metadata_path=None):
+    def __init__(self, train_data_dir, val_data_dir=None,batch_size=4, num_workers=4, chunk_size=1024, sample_rate=44100, split_bit=False, only_lower_bits=False, train_p=1.0, stereo_interleave=False, lb_dropout=0.0, epoch_expansion_factor=10, max_bit_depth=None, train_metadata_path=None, val_metadata_path=None):
         super().__init__()
-        self.data_dir = data_dir
+        self.train_data_dir = train_data_dir
+        self.val_data_dir = val_data_dir
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.chunk_size = chunk_size
@@ -902,18 +903,19 @@ class MonoDataModule(pl.LightningDataModule):
         self.lb_dropout = lb_dropout
         self.epoch_expansion_factor = epoch_expansion_factor
         self.max_bit_depth = max_bit_depth
-        self.metadata_path = metadata_path
+        self.train_metadata_path = train_metadata_path
+        self.val_metadata_path = val_metadata_path
 
     def setup(self, stage=None):
-        train_dir = os.path.join(self.data_dir, 'train')
-        valid_dir = os.path.join(self.data_dir, 'valid')
+        train_dir = self.train_data_dir
+        valid_dir = self.val_data_dir
 
         # If explicit train/valid subdirectories exist, use them
         if os.path.isdir(train_dir) and os.path.isdir(valid_dir):
             # train_full = MonoWavChunkDataset(train_dir, chunk_size=self.chunk_size, bit_split=self.split_bit, only_lower_bits=self.only_lower_bits, stereo_interleave=self.stereo_interleave, lb_dropout=self.lb_dropout, epoch_expansion_factor=self.epoch_expansion_factor)
             # val_ds = MonoWavChunkDataset(valid_dir, chunk_size=self.chunk_size, bit_split=self.split_bit, only_lower_bits=self.only_lower_bits, stereo_interleave=self.stereo_interleave, lb_dropout=0.0, epoch_expansion_factor=self.epoch_expansion_factor)
-            train_full = TriloByteDataset(train_dir, chunk_size=self.chunk_size, sample_rate=self.sample_rate, stereo_interleave=self.stereo_interleave, lb_dropout=self.lb_dropout, epoch_expansion_factor=self.epoch_expansion_factor, max_bit_depth=self.max_bit_depth, metadata_path=self.metadata_path)
-            val_ds = TriloByteDataset(valid_dir, chunk_size=self.chunk_size, sample_rate=self.sample_rate, stereo_interleave=self.stereo_interleave, lb_dropout=0.0, epoch_expansion_factor=self.epoch_expansion_factor, max_bit_depth=self.max_bit_depth, metadata_path=self.metadata_path)
+            train_full = TriloByteDataset(train_dir, chunk_size=self.chunk_size, sample_rate=self.sample_rate, stereo_interleave=self.stereo_interleave, lb_dropout=self.lb_dropout, epoch_expansion_factor=self.epoch_expansion_factor, max_bit_depth=self.max_bit_depth, metadata_path=self.train_metadata_path)
+            val_ds = TriloByteDataset(valid_dir, chunk_size=self.chunk_size, sample_rate=self.sample_rate, stereo_interleave=self.stereo_interleave, lb_dropout=0.0, epoch_expansion_factor=self.epoch_expansion_factor, max_bit_depth=self.max_bit_depth, metadata_path=self.val_metadata_path)
 
             if self.train_p < 1.0:
                 n = len(train_full)
@@ -929,7 +931,7 @@ class MonoDataModule(pl.LightningDataModule):
             self.val_ds = val_ds
         else:
             # Fallback: use single directory and split internally (original behavior)
-            dataset = TriloByteDataset(self.data_dir, chunk_size=self.chunk_size, sample_rate=self.sample_rate, stereo_interleave=self.stereo_interleave, lb_dropout=self.lb_dropout, epoch_expansion_factor=self.epoch_expansion_factor, max_bit_depth=self.max_bit_depth, metadata_path=self.metadata_path)
+            dataset = TriloByteDataset(self.train_data_dir, chunk_size=self.chunk_size, sample_rate=self.sample_rate, stereo_interleave=self.stereo_interleave, lb_dropout=self.lb_dropout, epoch_expansion_factor=self.epoch_expansion_factor, max_bit_depth=self.max_bit_depth, metadata_path=self.train_metadata_path)
             n = len(dataset)
             n_train = int(0.9 * n)
             self.train_ds, self.val_ds, _ = torch.utils.data.random_split(dataset, [int(n_train * self.train_p), n - n_train, n_train - int(n_train * self.train_p)])
@@ -949,7 +951,8 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, required=True)
+    parser.add_argument('--train_data_dir', type=str, required=True)
+    parser.add_argument('--val_data_dir', type=str, default=None)
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--model_name', type=str, default='gpt2')
@@ -976,7 +979,8 @@ def main():
     parser.add_argument('--ckpt_path', type=str, default=None, help='Path to a checkpoint to resume from')
     parser.add_argument('--epoch_expansion_factor', type=int, default=1, help='Factor to expand dataset size per epoch')
     parser.add_argument('--max_bit_depth', type=int, default=None, help='Maximum bit depth of audio data (8, 16, or 24). If not set, infer from data.')
-    parser.add_argument('--metadata_path', type=str, default=None, help='Path to metadata file for the dataset (if any)')
+    parser.add_argument('--train_metadata_path', type=str, default=None, help='Path to metadata file for the training dataset (if any)')
+    parser.add_argument('--val_metadata_path', type=str, default=None, help='Path to metadata file for the validation dataset (if any)')
     args = parser.parse_args()
 
     # set seeds
@@ -985,7 +989,7 @@ def main():
     wandb_logger = WandbLogger(project=args.project)
 
     model = GPTAudioLightningModule(**vars(args))
-    dm = MonoDataModule(args.data_dir, batch_size=args.batch_size, chunk_size=args.chunk_size, sample_rate=args.sample_rate, split_bit=args.split_bit, only_lower_bits=args.only_lower_bits, train_p=args.train_p, stereo_interleave=args.stereo_interleave, lb_dropout=args.lb_dropout, epoch_expansion_factor=args.epoch_expansion_factor, max_bit_depth=args.max_bit_depth, metadata_path=args.metadata_path)
+    dm = MonoDataModule(args.train_data_dir, args.val_data_dir, batch_size=args.batch_size, chunk_size=args.chunk_size, sample_rate=args.sample_rate, split_bit=args.split_bit, only_lower_bits=args.only_lower_bits, train_p=args.train_p, stereo_interleave=args.stereo_interleave, lb_dropout=args.lb_dropout, epoch_expansion_factor=args.epoch_expansion_factor, max_bit_depth=args.max_bit_depth, train_metadata_path=args.train_metadata_path, val_metadata_path=args.val_metadata_path)
 
 
     checkpoint_callback = ModelCheckpoint(
