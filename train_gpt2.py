@@ -308,10 +308,19 @@ class TriloByteDataset(Dataset):
     def __getitem__(self, idx):
         path, metadata = self.files[idx]
         file_length = metadata['length']
+        sample_rate = metadata['sample_rate']
         # randomly sample a chunk of chunk_size from the file
         chunk_size = self.chunk_size + 1
+        if sample_rate != self.sample_rate:
+            base_chunk_size = chunk_size
+            chunk_size = int(chunk_size * sample_rate / self.sample_rate)
         offset = torch.randint(0, max(1, file_length - chunk_size), (1,)).item()
         wav, sr = torchaudio.load(path, normalize=True, frame_offset=offset, num_frames=chunk_size, backend="soundfile")
+        if sample_rate != self.sample_rate:
+            print(f"Resampling from {sample_rate} to {self.sample_rate}")
+            wav = torchaudio.functional.resample(wav, sample_rate, self.sample_rate).clamp(-1.0, 1.0)
+            assert wav.shape[1] == base_chunk_size, f"Resampled wav length {wav.shape[1]} does not match expected chunk size {base_chunk_size}"
+            chunk_size = base_chunk_size
         wav = quantize_unsigned_pcm_torch(wav, n_bits=self.max_bit_depth if self.max_bit_depth is not None else 24)
 
         # randomly sample left or right channel
@@ -378,9 +387,9 @@ class TriloByteDataset(Dataset):
             bit1 = lsb_torch(wav, n_bits=8)
             wav = bit1
 
-        if sr != self.sample_rate:
-            print(f"Resampling from {sr} to {self.sample_rate}")
-            wav = torchaudio.functional.resample(wav, sr, self.sample_rate)
+        # if sr != self.sample_rate:
+        #     print(f"Resampling from {sr} to {self.sample_rate}")
+        #     wav = torchaudio.functional.resample(wav, sr, self.sample_rate)
         if len(wav) < self.chunk_size+1:
             print(f"Padding audio from {len(wav)} to {self.chunk_size+1}")
             wav = torch.nn.functional.pad(wav, (0, self.chunk_size+1 - len(wav)), mode='constant', value=q_zero(bits=8))
