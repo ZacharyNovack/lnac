@@ -912,6 +912,7 @@ class MonoDataModule(pl.LightningDataModule):
 
         # If explicit train/valid subdirectories exist, use them
         if os.path.isdir(train_dir) and os.path.isdir(valid_dir):
+            print("HEY, WE'RE USING EXPLICIT TRAIN/VALID DIRECTORIES")
             # train_full = MonoWavChunkDataset(train_dir, chunk_size=self.chunk_size, bit_split=self.split_bit, only_lower_bits=self.only_lower_bits, stereo_interleave=self.stereo_interleave, lb_dropout=self.lb_dropout, epoch_expansion_factor=self.epoch_expansion_factor)
             # val_ds = MonoWavChunkDataset(valid_dir, chunk_size=self.chunk_size, bit_split=self.split_bit, only_lower_bits=self.only_lower_bits, stereo_interleave=self.stereo_interleave, lb_dropout=0.0, epoch_expansion_factor=self.epoch_expansion_factor)
             train_full = TriloByteDataset(train_dir, chunk_size=self.chunk_size, sample_rate=self.sample_rate, stereo_interleave=self.stereo_interleave, lb_dropout=self.lb_dropout, epoch_expansion_factor=self.epoch_expansion_factor, max_bit_depth=self.max_bit_depth, metadata_path=self.train_metadata_path)
@@ -930,6 +931,7 @@ class MonoDataModule(pl.LightningDataModule):
             self.train_ds = train_ds
             self.val_ds = val_ds
         else:
+            print("HEY, WE'RE USING A SINGLE DIRECTORY FOR TRAIN/VALID, IF YOU DIDNT SET UP SPLITS YET, THIS WILL DO IT FOR YOU")
             # Fallback: use single directory and split internally (original behavior)
             dataset = TriloByteDataset(self.train_data_dir, chunk_size=self.chunk_size, sample_rate=self.sample_rate, stereo_interleave=self.stereo_interleave, lb_dropout=self.lb_dropout, epoch_expansion_factor=self.epoch_expansion_factor, max_bit_depth=self.max_bit_depth, metadata_path=self.train_metadata_path)
             n = len(dataset)
