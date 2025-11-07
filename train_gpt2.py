@@ -888,7 +888,7 @@ class GPTAudioLightningModule(pl.LightningModule):
 # Data Module
 # =====================
 class MonoDataModule(pl.LightningDataModule):
-    def __init__(self, train_data_dir, val_data_dir=None,batch_size=4, num_workers=4, chunk_size=1024, sample_rate=44100, split_bit=False, only_lower_bits=False, train_p=1.0, stereo_interleave=False, lb_dropout=0.0, epoch_expansion_factor=10, max_bit_depth=None, train_metadata_path=None, val_metadata_path=None):
+    def __init__(self, train_data_dir, val_data_dir='',batch_size=4, num_workers=4, chunk_size=1024, sample_rate=44100, split_bit=False, only_lower_bits=False, train_p=1.0, stereo_interleave=False, lb_dropout=0.0, epoch_expansion_factor=10, max_bit_depth=None, train_metadata_path=None, val_metadata_path=None):
         super().__init__()
         self.train_data_dir = train_data_dir
         self.val_data_dir = val_data_dir
@@ -935,8 +935,9 @@ class MonoDataModule(pl.LightningDataModule):
             # Fallback: use single directory and split internally (original behavior)
             dataset = TriloByteDataset(self.train_data_dir, chunk_size=self.chunk_size, sample_rate=self.sample_rate, stereo_interleave=self.stereo_interleave, lb_dropout=self.lb_dropout, epoch_expansion_factor=self.epoch_expansion_factor, max_bit_depth=self.max_bit_depth, metadata_path=self.train_metadata_path)
             n = len(dataset)
-            n_train = int(0.9 * n)
-            self.train_ds, self.val_ds, _ = torch.utils.data.random_split(dataset, [int(n_train * self.train_p), n - n_train, n_train - int(n_train * self.train_p)])
+            frac_n = int(n * self.train_p)
+            n_train = int(0.9 * frac_n)
+            self.train_ds, self.val_ds, _ = torch.utils.data.random_split(dataset, [n_train, frac_n - n_train, n - frac_n])
             self.val_ds.lb_dropout = 0.0  # no dropout for validation
 
     def train_dataloader(self):
@@ -954,7 +955,7 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--train_data_dir', type=str, required=True)
-    parser.add_argument('--val_data_dir', type=str, default=None)
+    parser.add_argument('--val_data_dir', type=str, default='')
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--model_name', type=str, default='gpt2')
@@ -982,7 +983,7 @@ def main():
     parser.add_argument('--epoch_expansion_factor', type=int, default=1, help='Factor to expand dataset size per epoch')
     parser.add_argument('--max_bit_depth', type=int, default=None, help='Maximum bit depth of audio data (8, 16, or 24). If not set, infer from data.')
     parser.add_argument('--train_metadata_path', type=str, default=None, help='Path to metadata file for the training dataset (if any)')
-    parser.add_argument('--val_metadata_path', type=str, default=None, help='Path to metadata file for the validation dataset (if any)')
+    parser.add_argument('--val_metadata_path', type=str, default='', help='Path to metadata file for the validation dataset (if any)')
     args = parser.parse_args()
 
     # set seeds
