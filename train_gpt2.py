@@ -22,6 +22,8 @@ from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
 from PIL import Image
 
+from splus import SPlus
+
 def minmax_scale(tensor, range_min=0, range_max=1):
     """
     Min-max scaling to [0, 1].
@@ -271,7 +273,10 @@ class MonoWavChunkDataset(Dataset):
 class TriloByteDataset(Dataset):
 
     def __init__(self, data_dir: str, chunk_size: int = 4096, sample_rate: int = 44100, epoch_expansion_factor: int = 10, stereo_interleave: bool = False, lb_dropout: Union[float, List[float]] = 0.0, max_bit_depth: int = None, metadata_path: Optional[str] = None):
+        lengths = json.load(open(metadata_path, 'r'))
         self.files = sorted(os.path.join(root, f) for root, _, files in os.walk(data_dir) for f in files if (f.endswith('.flac') or f.endswith('.wav')))
+        # filter for files present in lengths
+        self.files = [f for f in self.files if os.path.basename(f) in lengths]
         self.chunk_size = chunk_size
         self.sample_rate = sample_rate
 
@@ -293,12 +298,16 @@ class TriloByteDataset(Dataset):
             raise ValueError("files is empty")
         print(f"TriloByteDataset: {len(self.files)} files, chunk_size={self.chunk_size}")
         # pth = metadata_path.split('.')[0] + '_train.json' if 'train' in data_dir else metadata_path.split('.')[0] + '_valid.json' if 'valid' in data_dir else metadata_path
-        lengths = json.load(open(metadata_path, 'r'))
+        
         for ix, f in enumerate(tqdm(self.files)):
             self.files[ix] = (f, lengths[os.path.basename(f)])  # (path, num_samples)
 
         # filter files for samples < chunk_size*10
-        self.files = [file for file in self.files if file[1]['length'] >= self.chunk_size * 10]
+        filter_rate = self.sample_rate if self.sample_rate is not None else 44100
+        self.files = [file for file in self.files if file[1]['length'] >= self.chunk_size * file[1]['sample_rate'] // filter_rate * 10]
+        # if self.max_bit_depth is not None:
+        #     # filter for files with bits_per_sample == max_bit_depth
+        #     self.files = [file for file in self.files if file[1]['bits_per_sample'] == self.max_bit_depth]
         self.files = self.files * self.epoch_expansion_factor
         random.shuffle(self.files)
 
@@ -306,101 +315,110 @@ class TriloByteDataset(Dataset):
         return len(self.files)
 
     def __getitem__(self, idx):
-        path, metadata = self.files[idx]
-        file_length = metadata['length']
-        sample_rate = metadata['sample_rate']
-        # randomly sample a chunk of chunk_size from the file
-        chunk_size = self.chunk_size + 1
-        if sample_rate != self.sample_rate:
-            base_chunk_size = chunk_size
-            chunk_size = int(chunk_size * sample_rate / self.sample_rate)
-        offset = torch.randint(0, max(1, file_length - chunk_size), (1,)).item()
-        wav, sr = torchaudio.load(path, normalize=True, frame_offset=offset, num_frames=chunk_size, backend="soundfile")
-        if sample_rate != self.sample_rate:
-            print(f"Resampling from {sample_rate} to {self.sample_rate}")
-            wav = torchaudio.functional.resample(wav, sample_rate, self.sample_rate).clamp(-1.0, 1.0)
-            assert wav.shape[1] == base_chunk_size, f"Resampled wav length {wav.shape[1]} does not match expected chunk size {base_chunk_size}"
-            chunk_size = base_chunk_size
-        wav = quantize_unsigned_pcm_torch(wav, n_bits=self.max_bit_depth if self.max_bit_depth is not None else 24)
+        try:
+            path, metadata = self.files[idx]
+            file_length = metadata['length']
+            sample_rate = metadata['sample_rate']
+            # randomly sample a chunk of chunk_size from the file
+            chunk_size = self.chunk_size + 1
+            if self.sample_rate is not None and sample_rate != self.sample_rate:
+                base_chunk_size = chunk_size
+                chunk_size = int(chunk_size * sample_rate / self.sample_rate)
+            offset = torch.randint(0, max(1, file_length - chunk_size), (1,)).item()
+            wav, sr = torchaudio.load(path, normalize=True, frame_offset=offset, num_frames=chunk_size, backend="soundfile")
+            if wav.shape[0] == 0 or wav.shape[1] == 0:
+                # empty file, return first one
+                return self[0]
+            if self.sample_rate is not None and sample_rate != self.sample_rate:
+                # print(f"Resampling from {sample_rate} to {self.sample_rate}")
+                wav = torchaudio.functional.resample(wav, sample_rate, self.sample_rate).clamp(-1.0, 1.0)
+                assert wav.shape[1] == base_chunk_size, f"Resampled wav length {wav.shape[1]} does not match expected chunk size {base_chunk_size}"
+                chunk_size = base_chunk_size
+            wav = quantize_unsigned_pcm_torch(wav, n_bits=self.max_bit_depth if self.max_bit_depth is not None else 24)
 
-        # randomly sample left or right channel
-        if self.stereo_interleave and wav.shape[0] == 2:
-            # put left, then right or right then left
-            interleaved = torch.zeros(wav.shape[1] * 2, dtype=wav.dtype)
-            if torch.rand(1).item() < 0.5:
-                interleaved[:wav.shape[1]] = wav[0]
-                interleaved[wav.shape[1]:] = wav[1]
-            else:
-                interleaved[:wav.shape[1]] = wav[1]
-                interleaved[wav.shape[1]:] = wav[0]
-            wav = interleaved
-        else:
-            # if stereo, randomly pick one channel
-            if wav.shape[0] == 2:
+            # randomly sample left or right channel
+            if self.stereo_interleave:
+                if wav.shape[0] < 2:
+                    # if mono, duplicate channel
+                    wav = torch.cat([wav, wav], dim=0)
+                # put left, then right or right then left
+                interleaved = torch.zeros(wav.shape[1] * 2, dtype=wav.dtype)
                 if torch.rand(1).item() < 0.5:
-                    wav = wav[1]  # take right channel only
+                    interleaved[:wav.shape[1]] = wav[0]
+                    interleaved[wav.shape[1]:] = wav[1]
                 else:
-                    wav = wav[0]  # take left channel only
+                    interleaved[:wav.shape[1]] = wav[1]
+                    interleaved[wav.shape[1]:] = wav[0]
+                wav = interleaved
             else:
-                wav = wav[0]  # mono
-        # split bits into 3 bytes if 24 bits, or 2 bytes if 16 bits, or 1 byte if 8 bits
-        if self.max_bit_depth == 24 or self.max_bit_depth is None:
-            bit1 = msb_torch(wav, orig_n_bits=24, n_bits=8)
-            bit2 = lsb_torch(msb_torch(wav, orig_n_bits=24, n_bits=16), n_bits=8)
-            bit3 = lsb_torch(wav, n_bits=8)
-            # if the original bit depth is 16 or 8, apply dropout to the lower bytes
-            if metadata['bits_per_sample'] == 16:
-                # drop bit3, since there is no bit3 in original signal
-                bit3 = torch.full_like(bit3, self.lb_mask_token)
-            elif metadata['bits_per_sample'] == 8:
-                # drop bit2 and bit3
-                bit2 = torch.full_like(bit2, self.lb_mask_token)
-                bit3 = torch.full_like(bit3, self.lb_mask_token)
-            # drop lower bytes with probability lb_dropout
-            if isinstance(self.lb_dropout, list):
-                if len(self.lb_dropout) != 2:
-                    raise ValueError("lb_dropout list must have length 2")
-                if torch.rand(1).item() < self.lb_dropout[0]:
+                # if stereo, randomly pick one channel
+                if wav.shape[0] == 2:
+                    if torch.rand(1).item() < 0.5:
+                        wav = wav[1]  # take right channel only
+                    else:
+                        wav = wav[0]  # take left channel only
+                else:
+                    wav = wav[0]  # mono
+            # split bits into 3 bytes if 24 bits, or 2 bytes if 16 bits, or 1 byte if 8 bits
+            if self.max_bit_depth == 24 or self.max_bit_depth is None:
+                bit1 = msb_torch(wav, orig_n_bits=24, n_bits=8)
+                bit2 = (wav >> 8) & 0xFF
+                bit3 = lsb_torch(wav, n_bits=8)
+                # if the original bit depth is 16 or 8, apply dropout to the lower bytes
+                if metadata['bits_per_sample'] == 16:
+                    # drop bit3, since there is no bit3 in original signal
+                    bit3 = torch.full_like(bit3, self.lb_mask_token)
+                elif metadata['bits_per_sample'] == 8:
+                    # drop bit2 and bit3
                     bit2 = torch.full_like(bit2, self.lb_mask_token)
                     bit3 = torch.full_like(bit3, self.lb_mask_token)
-                elif torch.rand(1).item() < self.lb_dropout[1]:
-                    bit3 = torch.full_like(bit3, self.lb_mask_token)
-            else:
+                # drop lower bytes with probability lb_dropout
+                if isinstance(self.lb_dropout, list):
+                    if len(self.lb_dropout) != 2:
+                        raise ValueError("lb_dropout list must have length 2")
+                    if torch.rand(1).item() < self.lb_dropout[0]:
+                        bit2 = torch.full_like(bit2, self.lb_mask_token)
+                        bit3 = torch.full_like(bit3, self.lb_mask_token)
+                    elif torch.rand(1).item() < self.lb_dropout[1]:
+                        bit3 = torch.full_like(bit3, self.lb_mask_token)
+                else:
+                    if torch.rand(1).item() < self.lb_dropout:
+                        bit2 = torch.full_like(bit2, self.lb_mask_token)
+                        bit3 = torch.full_like(bit3, self.lb_mask_token)
+                    elif torch.rand(1).item() < self.lb_dropout:
+                        bit3 = torch.full_like(bit3, self.lb_mask_token)
+                wav = torch.stack([bit1, bit2, bit3], dim=1).view(-1)
+            elif self.max_bit_depth == 16:
+                bit1 = msb_torch(wav, orig_n_bits=16, n_bits=8)
+                bit2 = lsb_torch(wav, n_bits=8)
+                # if the original bit depth is 8, apply dropout to the lower byte
+                if metadata['bits_per_sample'] == 8:
+                    # drop bit2, since there is no bit2 in original signal
+                    bit2 = torch.full_like(bit2, self.lb_mask_token)
+                # drop lower byte with probability lb_dropout
                 if torch.rand(1).item() < self.lb_dropout:
                     bit2 = torch.full_like(bit2, self.lb_mask_token)
-                    bit3 = torch.full_like(bit3, self.lb_mask_token)
-                elif torch.rand(1).item() < self.lb_dropout:
-                    bit3 = torch.full_like(bit3, self.lb_mask_token)
-            wav = torch.stack([bit1, bit2, bit3], dim=1).view(-1)
-        elif self.max_bit_depth == 16:
-            bit1 = msb_torch(wav, orig_n_bits=16, n_bits=8)
-            bit2 = lsb_torch(wav, n_bits=8)
-            # if the original bit depth is 8, apply dropout to the lower byte
-            if metadata['bits_per_sample'] == 8:
-                # drop bit2, since there is no bit2 in original signal
-                bit2 = torch.full_like(bit2, self.lb_mask_token)
-            # drop lower byte with probability lb_dropout
-            if torch.rand(1).item() < self.lb_dropout:
-                bit2 = torch.full_like(bit2, self.lb_mask_token)
-            wav = torch.stack([bit1, bit2], dim=1).view(-1)
-        elif self.max_bit_depth == 8:
-            bit1 = lsb_torch(wav, n_bits=8)
-            wav = bit1
+                wav = torch.stack([bit1, bit2], dim=1).view(-1)
+            elif self.max_bit_depth == 8:
+                bit1 = lsb_torch(wav, n_bits=8)
+                wav = bit1
 
-        # if sr != self.sample_rate:
-        #     print(f"Resampling from {sr} to {self.sample_rate}")
-        #     wav = torchaudio.functional.resample(wav, sr, self.sample_rate)
-        if len(wav) < self.chunk_size+1:
-            print(f"Padding audio from {len(wav)} to {self.chunk_size+1}")
-            wav = torch.nn.functional.pad(wav, (0, self.chunk_size+1 - len(wav)), mode='constant', value=q_zero(bits=8))
+            # if sr != self.sample_rate:
+            #     print(f"Resampling from {sr} to {self.sample_rate}")
+            #     wav = torchaudio.functional.resample(wav, sr, self.sample_rate)
+            if len(wav) < self.chunk_size+1:
+                print(f"Padding audio from {len(wav)} to {self.chunk_size+1}")
+                wav = torch.nn.functional.pad(wav, (0, self.chunk_size+1 - len(wav)), mode='constant', value=q_zero(bits=8))
 
-        seq_len = self.chunk_size * (self.max_bit_depth // 8 if self.max_bit_depth is not None else 3) * (2 if self.stereo_interleave else 1)
-        seq_len = min(seq_len + 1, len(wav))
-        tokens = wav[:seq_len]
-        # input_tokens = tokens[:-1]
-        # target_tokens = tokens[1:]
-        return tokens
-
+            seq_len = self.chunk_size * (self.max_bit_depth // 8 if self.max_bit_depth is not None else 3) * (2 if self.stereo_interleave else 1)
+            seq_len = min(seq_len + 1, len(wav))
+            tokens = wav[:seq_len]
+            # input_tokens = tokens[:-1]
+            # target_tokens = tokens[1:]
+            return tokens
+        except Exception as e:
+            print(f"Error loading {self.files[idx][0]}: {e}. Returning a random other sample.")
+            return self[0]
 
 
 # =====================
@@ -430,10 +448,10 @@ class GPTAudioLightningModule(pl.LightningModule):
             case 8:
                 config.vocab_size = 256  # 256
 
-        if kwargs.get("lb_dropout", 0.0) > 0.0:
+        if kwargs.get("lb_dropout", 0.0) > 0.0 or max_bit_depth is None:
             config.vocab_size += 1  # add mask token for lower bits dropout
             self.lb_mask_token = config.vocab_size - 1
-        config.max_position_embeddings = 2049
+        config.max_position_embeddings = 6145
         self.model = GPT2LMHeadModel(config)
 
         if use_lora:
@@ -947,7 +965,8 @@ class MonoDataModule(pl.LightningDataModule):
             frac_n = int(n * self.train_p)
             n_train = int(0.9 * frac_n)
             self.train_ds, self.val_ds, _ = torch.utils.data.random_split(dataset, [n_train, frac_n - n_train, n - frac_n])
-            self.val_ds.lb_dropout = 0.0  # no dropout for validation
+            # TODO: This shit is broken! I don't think there's a way to random split like this and have different params for the underlying dataset
+            self.val_ds.dataset.lb_dropout = 0.0  # no dropout for validation
 
     def train_dataloader(self):
         return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
@@ -969,12 +988,12 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--model_name', type=str, default='gpt2')
     parser.add_argument('--chunk_size', type=int, default=1024)
-    parser.add_argument('--sample_rate', type=int, default=44100)
+    parser.add_argument('--sample_rate', type=int, default=None)
     parser.add_argument('--max_epochs', type=int, default=-1)
     parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--weight_decay', type=float, default=0.1)
     parser.add_argument('--warmup_steps', type=int, default=1000)
-    parser.add_argument('--max_steps', type=int, default=-1)
+    parser.add_argument('--max_steps', type=int, default=500_000)
     parser.add_argument('--min_lr', type=float, default=1e-6)
     parser.add_argument('--use_lora', action='store_true')
     parser.add_argument('--lora_r', type=int, default=8)
