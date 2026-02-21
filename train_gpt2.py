@@ -405,15 +405,18 @@ class TriloByteDataset(Dataset):
             elif self.max_bit_depth == 16:
 
                 bit1 = msb_torch(wav, orig_n_bits=16, n_bits=self.msb_n_bits)
-                bit2 = lsb_torch(wav, n_bits=16 - self.msb_n_bits)
-                # if the original bit depth is 8, apply dropout to the lower byte
-                if metadata['bits_per_sample'] == 8:
-                    # drop bit2, since there is no bit2 in original signal
-                    bit2 = torch.full_like(bit2, self.lb_mask_token)
-                # drop lower byte with probability lb_dropout
-                if torch.rand(1).item() < self.lb_dropout:
-                    bit2 = torch.full_like(bit2, self.lb_mask_token)
-                wav = torch.stack([bit1, bit2], dim=1).view(-1)
+                if self.msb_n_bits < 16:
+                    bit2 = lsb_torch(wav, n_bits=16 - self.msb_n_bits)
+                    # if the original bit depth is 8, apply dropout to the lower byte
+                    if metadata['bits_per_sample'] == 8:
+                        # drop bit2, since there is no bit2 in original signal
+                        bit2 = torch.full_like(bit2, self.lb_mask_token)
+                    # drop lower byte with probability lb_dropout
+                    if torch.rand(1).item() < self.lb_dropout:
+                        bit2 = torch.full_like(bit2, self.lb_mask_token)
+                    wav = torch.stack([bit1, bit2], dim=1).view(-1)
+                else:
+                    wav = bit1
             elif self.max_bit_depth == 8:
                 bit1 = lsb_torch(wav, n_bits=8)
                 wav = bit1
