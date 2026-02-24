@@ -304,7 +304,7 @@ class TriloByteDataset(Dataset):
             case 16:
                 self.lb_mask_token = msb_bits_2_vocab_size(self.msb_n_bits)
             case 8:
-                self.lb_mask_token = 256
+                self.lb_mask_token = msb_bits_2_vocab_size(self.msb_n_bits)
 
         if len(self.files) == 0:
             raise ValueError("files is empty")
@@ -317,9 +317,10 @@ class TriloByteDataset(Dataset):
         # filter files for samples < chunk_size*10
         filter_rate = self.sample_rate if self.sample_rate is not None else 44100
         self.files = [file for file in self.files if file[1]['length'] >= self.chunk_size * file[1]['sample_rate'] // filter_rate * 10]
-        # if self.max_bit_depth is not None:
-        #     # filter for files with bits_per_sample == max_bit_depth
-        #     self.files = [file for file in self.files if file[1]['bits_per_sample'] == self.max_bit_depth]
+        if self.max_bit_depth is not None and self.lb_dropout == 0.0:
+            print(f"Filtering files for max bit depth {self.max_bit_depth} with no lower bit dropout")
+            # filter for files with bits_per_sample == max_bit_depth
+            self.files = [file for file in self.files if file[1]['bits_per_sample'] == self.max_bit_depth]
         self.files = self.files * self.epoch_expansion_factor
         random.shuffle(self.files)
 
@@ -327,7 +328,7 @@ class TriloByteDataset(Dataset):
         return len(self.files)
 
     def __getitem__(self, idx):
-        # try:
+        try:
             path, metadata = self.files[idx]
             file_length = metadata['length']
             sample_rate = metadata['sample_rate']
@@ -375,33 +376,36 @@ class TriloByteDataset(Dataset):
                     wav = wav[0]  # mono
             # split bits into 3 bytes if 24 bits, or 2 bytes if 16 bits, or 1 byte if 8 bits
             if self.max_bit_depth == 24 or self.max_bit_depth is None:
-                bit1 = msb_torch(wav, orig_n_bits=24, n_bits=8)
-                bit2 = (wav >> 8) & 0xFF
-                bit3 = lsb_torch(wav, n_bits=8)
-                # if the original bit depth is 16 or 8, apply dropout to the lower bytes
-                if metadata['bits_per_sample'] == 16:
-                    # drop bit3, since there is no bit3 in original signal
-                    bit3 = torch.full_like(bit3, self.lb_mask_token)
-                elif metadata['bits_per_sample'] == 8:
-                    # drop bit2 and bit3
-                    bit2 = torch.full_like(bit2, self.lb_mask_token)
-                    bit3 = torch.full_like(bit3, self.lb_mask_token)
-                # drop lower bytes with probability lb_dropout
-                if isinstance(self.lb_dropout, list):
-                    if len(self.lb_dropout) != 2:
-                        raise ValueError("lb_dropout list must have length 2")
-                    if torch.rand(1).item() < self.lb_dropout[0]:
+                bit1 = msb_torch(wav, orig_n_bits=24, n_bits=self.msb_n_bits)
+                if self.msb_n_bits < 24:
+                    bit2 = (wav >> 8) & 0xFF
+                    bit3 = lsb_torch(wav, n_bits=24 - self.msb_n_bits - 8)
+                    # if the original bit depth is 16 or 8, apply dropout to the lower bytes
+                    if metadata['bits_per_sample'] == 16:
+                        # drop bit3, since there is no bit3 in original signal
+                        bit3 = torch.full_like(bit3, self.lb_mask_token)
+                    elif metadata['bits_per_sample'] == 8:
+                        # drop bit2 and bit3
                         bit2 = torch.full_like(bit2, self.lb_mask_token)
                         bit3 = torch.full_like(bit3, self.lb_mask_token)
-                    elif torch.rand(1).item() < self.lb_dropout[1]:
-                        bit3 = torch.full_like(bit3, self.lb_mask_token)
+                    # drop lower bytes with probability lb_dropout
+                    if isinstance(self.lb_dropout, list):
+                        if len(self.lb_dropout) != 2:
+                            raise ValueError("lb_dropout list must have length 2")
+                        if torch.rand(1).item() < self.lb_dropout[0]:
+                            bit2 = torch.full_like(bit2, self.lb_mask_token)
+                            bit3 = torch.full_like(bit3, self.lb_mask_token)
+                        elif torch.rand(1).item() < self.lb_dropout[1]:
+                            bit3 = torch.full_like(bit3, self.lb_mask_token)
+                    else:
+                        if torch.rand(1).item() < self.lb_dropout:
+                            bit2 = torch.full_like(bit2, self.lb_mask_token)
+                            bit3 = torch.full_like(bit3, self.lb_mask_token)
+                        elif torch.rand(1).item() < self.lb_dropout:
+                            bit3 = torch.full_like(bit3, self.lb_mask_token)
+                    wav = torch.stack([bit1, bit2, bit3], dim=1).view(-1)
                 else:
-                    if torch.rand(1).item() < self.lb_dropout:
-                        bit2 = torch.full_like(bit2, self.lb_mask_token)
-                        bit3 = torch.full_like(bit3, self.lb_mask_token)
-                    elif torch.rand(1).item() < self.lb_dropout:
-                        bit3 = torch.full_like(bit3, self.lb_mask_token)
-                wav = torch.stack([bit1, bit2, bit3], dim=1).view(-1)
+                    wav = bit1
             elif self.max_bit_depth == 16:
 
                 bit1 = msb_torch(wav, orig_n_bits=16, n_bits=self.msb_n_bits)
@@ -434,9 +438,9 @@ class TriloByteDataset(Dataset):
             # input_tokens = tokens[:-1]
             # target_tokens = tokens[1:]
             return tokens
-        # except Exception as e:
-        #     print(f"Error loading {self.files[idx][0]}: {e}. Returning a random other sample.")
-        #     return self[0]
+        except Exception as e:
+            print(f"Error loading {self.files[idx][0]}: {e}. Returning a random other sample.")
+            return self[0]
 
 
 # =====================
@@ -468,7 +472,8 @@ class GPTAudioLightningModule(pl.LightningModule):
         #     config.vocab_size = 65536  # 16-bit tokens
         match max_bit_depth:
             case 24 | None:
-                config.vocab_size = 768  # 256 + 256 + 256
+                config.vocab_size = 768
+                print(f"[VOCAB SIZE] Using vocab size {config.vocab_size} for max bit depth {max_bit_depth} with MSB bits {self.hparams.msb_n_bits} and LSB bits {24 - self.hparams.msb_n_bits}")
             case 16:
                 config.vocab_size = msb_bits_2_vocab_size(self.hparams.msb_n_bits)
                 print(f"[VOCAB SIZE] Using vocab size {config.vocab_size} for max bit depth {max_bit_depth} with MSB bits {self.hparams.msb_n_bits} and LSB bits {16 - self.hparams.msb_n_bits}")
@@ -1007,9 +1012,16 @@ class MonoDataModule(pl.LightningDataModule):
             n = len(dataset)
             frac_n = int(n * self.train_p)
             n_train = int(0.9 * frac_n)
-            self.train_ds, self.val_ds, _ = torch.utils.data.random_split(dataset, [n_train, frac_n - n_train, n - frac_n])
-            # TODO: This shit is broken! I don't think there's a way to random split like this and have different params for the underlying dataset
-            self.val_ds.dataset.lb_dropout = 0.0  # no dropout for validation
+            # manually split this dataset into train and validation sets (90% train, 10% val) by subsetting the dataset.files list
+            train_files = dataset.files[:n_train]
+            val_files = dataset.files[n_train:frac_n]
+            train_dataset = TriloByteDataset(self.train_data_dir, chunk_size=self.chunk_size, sample_rate=self.sample_rate, stereo_interleave=self.stereo_interleave, lb_dropout=self.lb_dropout, epoch_expansion_factor=self.epoch_expansion_factor, max_bit_depth=self.max_bit_depth, metadata_path=self.train_metadata_path, encoding=self.encoding)
+            val_dataset = TriloByteDataset(self.train_data_dir, chunk_size=self.chunk_size, sample_rate=self.sample_rate, stereo_interleave=self.stereo_interleave, lb_dropout=0.0, epoch_expansion_factor=self.epoch_expansion_factor, max_bit_depth=self.max_bit_depth, metadata_path=self.train_metadata_path, encoding=self.encoding)
+            train_dataset.files = train_files
+            val_dataset.files = [f for f in val_files if f[1]['bits_per_sample'] == int(self.max_bit_depth.split("_")[0])]  # filter val files to only include those with the correct bit depth (in case of mixed bit depths in the same directory)
+            print(f"Total files: {len(dataset.files)}, Train files: {len(train_dataset.files)}, Val files: {len(val_dataset.files)}")
+            self.train_ds = train_dataset
+            self.val_ds = val_dataset
 
     def train_dataloader(self):
         return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
@@ -1052,6 +1064,7 @@ def main():
     parser.add_argument('--stereo_interleave', action='store_true', help='Whether to interleave stereo channels')
     parser.add_argument('--lb_dropout', type=float, default=0.0, help='Probability of dropping out lower bits when using bit-splitting')
     parser.add_argument('--ckpt_path', type=str, default=None, help='Path to a checkpoint to resume from')
+    parser.add_argument('--ckpt_not_dropout', action='store_true', help='Whether the loaded checkpoint was trained without dropout (if so, we need to modify the state dict so that the model.transformer.wte.weight and model.lm_head.weight are 1 larger to account for the added mask token)')
     parser.add_argument('--epoch_expansion_factor', type=int, default=1, help='Factor to expand dataset size per epoch')
     parser.add_argument('--max_bit_depth', type=str, default=None, help='Maximum bit depth of audio data (8, 16, or 24). If not set, infer from data.')
     parser.add_argument('--train_metadata_path', type=str, default=None, help='Path to metadata file for the training dataset (if any)')
@@ -1087,6 +1100,36 @@ def main():
         gradient_clip_val=1.0,
         log_every_n_steps=50,
     )
+
+
+    if args.ckpt_path is not None and args.ckpt_not_dropout:
+        # we need to modify the checkpoint state dict to add the mask token weights (initialized to 0) to the wte and lm_head weights
+        print("Modifying checkpoint state dict to add mask token weights...")
+        ckpt = torch.load(args.ckpt_path, map_location='cpu')
+        state_dict = ckpt['state_dict']
+        # find the size of the wte weight matrix and add a new row for the mask token
+        wte_weight = state_dict['model.transformer.wte.weight']
+        vocab_size, hidden_size = wte_weight.shape
+        new_wte_weight = torch.zeros((vocab_size + 1, hidden_size))
+        new_wte_weight[:-1, :] = wte_weight
+        state_dict['model.transformer.wte.weight'] = new_wte_weight
+        # do the same for the lm_head weight matrix
+        lm_head_weight = state_dict['model.lm_head.weight']
+        new_lm_head_weight = torch.zeros((vocab_size + 1, hidden_size))
+        new_lm_head_weight[:-1, :] = lm_head_weight
+        state_dict['model.lm_head.weight'] = new_lm_head_weight
+        # save the modified checkpoint to a new file
+        modified_ckpt_path = args.ckpt_path.replace('.ckpt', '_modified.ckpt')
+        torch.save(ckpt, modified_ckpt_path)
+        print(f"Modified checkpoint saved to {modified_ckpt_path}")
+        args.ckpt_path = modified_ckpt_path
+        # update the optimizer state if it exists, to account for the new parameters
+        # reset the optimizer state since the parameter shapes have changed
+        if 'optimizer_states' in ckpt:
+            print("Resetting optimizer state due to changed parameter shapes...")
+            ckpt['optimizer_states'] = []
+            torch.save(ckpt, modified_ckpt_path)
+            print(f"Optimizer state reset in modified checkpoint {modified_ckpt_path}")
 
     trainer.fit(model, datamodule=dm, ckpt_path=args.ckpt_path)
 
