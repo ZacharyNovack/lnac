@@ -146,139 +146,9 @@ def lsb_torch(x: torch.tensor, n_bits: int) -> torch.tensor:
     return x & ((1 << n_bits) - 1)
 
 
-# =====================
-# Dataset for Audio (o.g. implementation TODO: deprecated, remove this)
-# =====================
-class MonoWavChunkDataset(Dataset):
-    def __init__(self, data_dir, chunk_size=4096, sample_rate=44100, bit_split=False, epoch_expansion_factor=10, only_lower_bits=False, stereo_interleave=False, lb_dropout=0.0):
-        self.files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.wav')]
-        self.chunk_size = chunk_size
-        self.sample_rate = sample_rate
-        self.bit_split = bit_split
-        self.epoch_expansion_factor = epoch_expansion_factor
-        self.only_lower_bits = only_lower_bits
-        self.stereo_interleave = stereo_interleave
-        self.lb_dropout = lb_dropout
-
-        # define mask token for lower bits dropout
-        match self.bit_split:
-            case 2:
-                self.lb_mask_token = 512
-            case 4:
-                self.lb_mask_token = 64
-            case 3:
-                self.lb_mask_token = 272
-
-        if len(self.files) == 0:
-            raise ValueError("files is empty")
-        print(f"MonoWavChunkDataset: {len(self.files)} files, chunk_size={self.chunk_size}")
-        pth = 'musdbstereo_lengths_train.json' if 'train' in data_dir else 'musdbstereo_lengths_valid.json' if 'valid' in data_dir else 'musdbstereo_lengths.json'
-        lengths = json.load(open(pth, 'r'))
-        for ix, f in enumerate(tqdm(self.files)):
-            self.files[ix] = (f, lengths[os.path.basename(f)])  # (path, num_samples)
-        self.files = self.files * self.epoch_expansion_factor
-        random.shuffle(self.files)
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, idx):
-        path, file_length = self.files[idx]
-        # randomly sample a chunk of chunk_size from the file
-        chunk_size = self.chunk_size + 1
-        offset = torch.randint(0, max(1, file_length - chunk_size), (1,)).item()
-        wav, sr = torchaudio.load(path, normalize=False, frame_offset=offset, num_frames=chunk_size, backend="soundfile")
-        # wav, sr = torchaudio.load(path, normalize=False)
-        if wav.dtype != torch.int16:
-            wav = linear_encode(wav, bits=16)
-        else:
-            wav = wav.long() + 32768  # 
-
-        # randomly sample left or right channel
-        if self.stereo_interleave:
-            # put left, then right or right then left
-            interleaved = torch.zeros(wav.shape[1] * 2, dtype=wav.dtype)
-            if torch.rand(1).item() < 0.5:
-                interleaved[:wav.shape[1]] = wav[0]
-                interleaved[wav.shape[1]:] = wav[1]
-            else:
-                interleaved[:wav.shape[1]] = wav[1]
-                interleaved[wav.shape[1]:] = wav[0]
-            wav = interleaved
-        else:
-            # if stereo, randomly pick one channel
-            if wav.shape[0] == 2:
-                if torch.rand(1).item() < 0.5:
-                    wav = wav[1]  # take right channel only
-                else:
-                    wav = wav[0]  # take left channel only
-            else:
-                wav = wav[0]  # mono
-        # if bit_split is set, split each 16-bit value into two 8-bit values representing the high and low bytes
-        if self.bit_split:
-            splits = self.bit_split if type(self.bit_split) is int else 2
-            if splits == 2:
-                high_bits = (wav >> 8) & 0xFF
-                low_bits = wav & 0xFF
-                # add 2^8 to the low bits to distinguish them from high bits
-                low_bits += 256
-                # interleave high and low bits
-                if torch.rand(1).item() < self.lb_dropout:
-                    low_bits = torch.full_like(low_bits, self.lb_mask_token)
-
-                wav = torch.stack([high_bits, low_bits], dim=1).view(-1)
-                assert torch.all(wav[0] == high_bits[0])
-                assert torch.all(wav[1] == low_bits[0])
-            elif splits == 4:
-                byte3 = (wav >> 12) & 0x0F
-                byte2 = (wav >> 8) & 0x0F
-                byte1 = (wav >> 4) & 0x0F
-                byte0 = wav & 0x0F
-                # add 2^4, 2^8, 2^12 to distinguish them
-                byte2 += 16
-                byte1 += 32
-                byte0 += 48
-                wav = torch.stack([byte3, byte2, byte1, byte0], dim=1).view(-1)
-                assert torch.all(wav[0] == byte3[0])
-                assert torch.all(wav[1] == byte2[0])
-                assert torch.all(wav[2] == byte1[0])
-                assert torch.all(wav[3] == byte0[0])
-            elif splits == 3:
-                # first highest 8 bits, then next 4 bits, then lowest 4 bits
-                byte2 = (wav >> 8) & 0xFF
-                byte1 = (wav >> 4) & 0x0F
-                byte0 = wav & 0x0F
-                byte1 += 256
-                byte0 += 272
-                wav = torch.stack([byte2, byte1, byte0], dim=1).view(-1)
-                assert torch.all(wav[0] == byte2[0])
-                assert torch.all(wav[1] == byte1[0])
-                assert torch.all(wav[2] == byte0[0])
-        elif self.only_lower_bits:
-            wav = wav & 0xFF  # keep only the lower 8 bits
-
-
-        if sr != self.sample_rate:
-            wav = torchaudio.functional.resample(wav, sr, self.sample_rate)
-        if len(wav) < self.chunk_size+1:
-            wav = torch.nn.functional.pad(wav, (0, self.chunk_size+1 - len(wav)), mode='constant', value=q_zero(bits=16))
-        chunk = wav
-        tokens = chunk.long()
-        seq_len = self.chunk_size
-        if self.bit_split:
-            seq_len *= self.bit_split if type(self.bit_split) is int else 2
-        if self.stereo_interleave:
-            seq_len *= 2
-        seq_len = min(seq_len + 1, len(tokens))
-        tokens = tokens[:seq_len]
-        # input_tokens = tokens
-        # target_tokens = tokens[1:]
-        return tokens
-
-
 class TriloByteDataset(Dataset):
 
-    def __init__(self, data_dir: str, chunk_size: int = 4096, sample_rate: int = 44100, epoch_expansion_factor: int = 10, stereo_interleave: bool = False, lb_dropout: Union[float, List[float]] = 0.0, max_bit_depth: Union[int, str] = None, metadata_path: Optional[str] = None, encoding: str = 'linear'):
+    def __init__(self, data_dir: str, chunk_size: int = 4096, sample_rate: int = 44100, epoch_expansion_factor: int = 10, stereo_interleave: bool = False, lb_dropout: Union[float, List[float]] = 0.0, max_bit_depth: Union[int, str] = None, metadata_path: Optional[str] = None, encoding: str = 'linear', bit_depth_cap: Optional[int] = None):
         lengths = json.load(open(metadata_path, 'r'))
         self.files = sorted(os.path.join(root, f) for root, _, files in os.walk(data_dir) for f in files if (f.endswith('.flac') or f.endswith('.wav')))
         # filter for files present in lengths
@@ -296,6 +166,7 @@ class TriloByteDataset(Dataset):
         self.epoch_expansion_factor = epoch_expansion_factor
         self.stereo_interleave = stereo_interleave
         self.lb_dropout = lb_dropout
+        self.bit_depth_cap = bit_depth_cap
 
         # define mask token for lower bits dropout
         match self.max_bit_depth:
@@ -337,7 +208,7 @@ class TriloByteDataset(Dataset):
             if self.sample_rate is not None and sample_rate != self.sample_rate:
                 base_chunk_size = chunk_size
                 chunk_size = int(chunk_size * sample_rate / self.sample_rate)
-            offset = torch.randint(0, max(1, file_length - chunk_size), (1,)).item()
+            offset = torch.randint(0, max(1, file_length - chunk_size*3), (1,)).item()
             # print(f"Loading {path} at offset {offset} for chunk size {chunk_size}")
             wav, sr = torchaudio.load(path, normalize=True, frame_offset=offset, num_frames=chunk_size, backend="soundfile")
             if wav.shape[0] == 0 or wav.shape[1] == 0:
@@ -380,14 +251,16 @@ class TriloByteDataset(Dataset):
                 if self.msb_n_bits < 24:
                     bit2 = (wav >> 8) & 0xFF
                     bit3 = lsb_torch(wav, n_bits=24 - self.msb_n_bits - 8)
-                    # if the original bit depth is 16 or 8, apply dropout to the lower bytes
-                    if metadata['bits_per_sample'] == 16:
-                        # drop bit3, since there is no bit3 in original signal
+                    # if the original bit depth is 16 or 8 (or capped lower), mask the LSBs
+                    effective_bits = metadata['bits_per_sample']
+                    if self.bit_depth_cap is not None:
+                        effective_bits = min(effective_bits, self.bit_depth_cap)
+                    if effective_bits <= 16:
+                        # drop bit3: no data below 16-bit precision
                         bit3 = torch.full_like(bit3, self.lb_mask_token)
-                    elif metadata['bits_per_sample'] == 8:
-                        # drop bit2 and bit3
+                    if effective_bits <= 8:
+                        # drop bit2 as well: no data below 8-bit precision
                         bit2 = torch.full_like(bit2, self.lb_mask_token)
-                        bit3 = torch.full_like(bit3, self.lb_mask_token)
                     # drop lower bytes with probability lb_dropout
                     if isinstance(self.lb_dropout, list):
                         if len(self.lb_dropout) != 2:
@@ -411,9 +284,11 @@ class TriloByteDataset(Dataset):
                 bit1 = msb_torch(wav, orig_n_bits=16, n_bits=self.msb_n_bits)
                 if self.msb_n_bits < 16:
                     bit2 = lsb_torch(wav, n_bits=16 - self.msb_n_bits)
-                    # if the original bit depth is 8, apply dropout to the lower byte
-                    if metadata['bits_per_sample'] == 8:
-                        # drop bit2, since there is no bit2 in original signal
+                    # if the original bit depth is 8 (or capped to 8), mask the LSB
+                    effective_bits = metadata['bits_per_sample']
+                    if self.bit_depth_cap is not None:
+                        effective_bits = min(effective_bits, self.bit_depth_cap)
+                    if effective_bits <= 8:
                         bit2 = torch.full_like(bit2, self.lb_mask_token)
                     # drop lower byte with probability lb_dropout
                     if torch.rand(1).item() < self.lb_dropout:
@@ -434,13 +309,95 @@ class TriloByteDataset(Dataset):
 
             seq_len = self.chunk_size * (self.max_bit_depth // 8 if self.max_bit_depth is not None else 3) * (2 if self.stereo_interleave else 1)
             seq_len = min(seq_len + 1, len(wav))
-            tokens = wav[:seq_len]
-            # input_tokens = tokens[:-1]
-            # target_tokens = tokens[1:]
+            # if less than seq_len, pad with mask token
+            if len(wav) < seq_len:
+                wav = torch.nn.functional.pad(wav, (0, 3073 - len(wav)), mode='constant', value=self.lb_mask_token)
+                assert len(wav) == 3073, f"After padding, wav length {wav.shape} does not match expected seq_len {seq_len}"
+            # .clone() ensures the returned tensor owns its storage independently.
+            # Without it, wav[:seq_len] is a view; PyTorch's shared-memory collation
+            # in multi-worker DataLoaders calls resize_() on the underlying storage,
+            # which raises "Trying to resize storage that is not resizable".
+            tokens = wav[:3073].clone()
             return tokens
         except Exception as e:
             print(f"Error loading {self.files[idx][0]}: {e}. Returning a random other sample.")
             return self[0]
+
+
+def custom_collate_fn(batch):
+    # print([x.size() for x in batch])
+    # batch is a list of tensors of shape (seq_len,)
+    # stack into a tensor of shape (batch_size, seq_len)
+    return torch.stack([x.contiguous().clone() for x in batch if x.shape[0] == 3073], dim=0)
+
+# =====================
+# Multi-Dataset (Trilobyte unified, all bit-depths)
+# =====================
+class MultiTriloByteDataset(Dataset):
+    """
+    Combines multiple TriloByteDataset instances into a single dataset, normalizing
+    all audio to 24-bit Trilobyte representation regardless of native bit depth.
+
+    For 16-bit files: least significant byte (bit3) is set to the null/mask token (768).
+    For 8-bit files:  two least significant bytes (bit2, bit3) are set to the mask token.
+
+    All sub-datasets produce sequences of exactly the same token length:
+        global_chunk_size * 6 + 1 tokens  (the +1 is the LM causal shift window)
+
+    Stereo dataset config: loads global_chunk_size audio samples per channel
+    Mono dataset config:   loads global_chunk_size * 2 audio samples
+                           (same token count since 2x samples × 3 bytes = 6x)
+
+    Each entry in dataset_configs is a dict with keys:
+        data_dir            (str, required)
+        metadata_path       (str, required)
+        sample_rate         (int, optional – None means use file native rate)
+        encoding            (str, optional – 'linear' or 'mu-law', default 'linear')
+        stereo_interleave   (bool, optional, default False)
+    """
+
+    def __init__(
+        self,
+        dataset_configs: List[dict],
+        global_chunk_size: int,
+        epoch_expansion_factor: int = 1,
+        lb_dropout: Union[float, List[float]] = 0.0,
+    ):
+        self.global_chunk_size = global_chunk_size
+        self.sub_datasets = []
+
+        for cfg in dataset_configs:
+            stereo = cfg.get('stereo_interleave', False)
+            # Stereo: chunk_size * 3bytes * 2ch = chunk_size*6 tokens
+            # Mono:   (chunk_size*2) * 3bytes * 1ch = chunk_size*6 tokens
+            inner_chunk_size = global_chunk_size if stereo else global_chunk_size * 2
+            # per-dataset epoch_expansion_factor overrides the global default
+            ds_epoch_expansion = cfg.get('epoch_expansion_factor', epoch_expansion_factor)
+
+            ds = TriloByteDataset(
+                data_dir=cfg['data_dir'],
+                chunk_size=inner_chunk_size,
+                sample_rate=cfg.get('sample_rate', None),
+                epoch_expansion_factor=ds_epoch_expansion,
+                stereo_interleave=stereo,
+                lb_dropout=lb_dropout,
+                # max_bit_depth=None: forces 24-bit Trilobyte processing, skips
+                # the bit-depth file filter, and uses mask token 768 for LSBs
+                # that don't exist in the original lower-bit-depth signal.
+                max_bit_depth=None,
+                metadata_path=cfg['metadata_path'],
+                encoding=cfg.get('encoding', 'linear'),
+                bit_depth_cap=cfg.get('bit_depth_cap', None),
+            )
+            self.sub_datasets.append(ds)
+
+        self._concat = torch.utils.data.ConcatDataset(self.sub_datasets)
+
+    def __len__(self):
+        return len(self._concat)
+
+    def __getitem__(self, idx):
+        return self._concat[idx]
 
 
 # =====================
@@ -1031,16 +988,139 @@ class MonoDataModule(pl.LightningDataModule):
 
 
 # =====================
+# Multi-Dataset Data Module
+# =====================
+class MultiDataModule(pl.LightningDataModule):
+    """
+    Data module that reads a JSON config describing multiple datasets and combines
+    them into a single MultiTriloByteDataset for training and validation.
+
+    The model is always run in 24-bit Trilobyte mode (max_bit_depth=None),
+    so make sure to initialize GPTAudioLightningModule with max_bit_depth=None
+    when using this data module.
+
+    Config file format (JSON):
+    {
+        "datasets": [
+            {
+                "train_data_dir":     "/path/to/train",
+                "val_data_dir":       "/path/to/val",
+                "train_metadata_path": "/path/to/train_meta.json",
+                "val_metadata_path":   "/path/to/val_meta.json",
+                "sample_rate":        44100,       // optional, null uses file rate
+                "encoding":           "linear",    // optional, default "linear"
+                "stereo_interleave":  false        // optional, default false
+            },
+            ...
+        ]
+    }
+    """
+
+    def __init__(
+        self,
+        dataset_config_path: str,
+        batch_size: int = 8,
+        num_workers: int = 4,
+        global_chunk_size: int = 512,
+        epoch_expansion_factor: int = 1,
+        lb_dropout: Union[float, List[float]] = 0.0,
+        train_p: float = 1.0,
+    ):
+        super().__init__()
+        self.dataset_config_path = dataset_config_path
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.global_chunk_size = global_chunk_size
+        self.epoch_expansion_factor = epoch_expansion_factor
+        self.lb_dropout = lb_dropout
+        self.train_p = train_p
+
+    def _build_dataset(self, data_dir, metadata_path, ds_cfg, lb_dropout):
+        """Build a single TriloByteDataset with the shared normalization settings."""
+        stereo = ds_cfg.get('stereo_interleave', False)
+        inner_chunk_size = self.global_chunk_size if stereo else self.global_chunk_size * 2
+        ds_epoch_expansion = ds_cfg.get('epoch_expansion_factor', self.epoch_expansion_factor)
+        return TriloByteDataset(
+            data_dir=data_dir,
+            chunk_size=inner_chunk_size,
+            sample_rate=ds_cfg.get('sample_rate', None),
+            epoch_expansion_factor=ds_epoch_expansion,
+            stereo_interleave=stereo,
+            lb_dropout=lb_dropout,
+            max_bit_depth=None,
+            metadata_path=metadata_path,
+            encoding=ds_cfg.get('encoding', 'linear'),
+            bit_depth_cap=ds_cfg.get('bit_depth_cap', None),
+        )
+
+    def setup(self, stage=None):
+        config = json.load(open(self.dataset_config_path))
+
+        train_sub_datasets = []
+        val_sub_datasets = []
+
+        for key, ds_cfg in config['datasets'].items():
+            print(f"[MultiDataModule] Setting up dataset '{key}' with config: {ds_cfg}")
+            train_dir = ds_cfg['train_data_dir']
+            val_dir = ds_cfg.get('val_data_dir', '')
+            train_meta = ds_cfg['train_metadata_path']
+            val_meta = ds_cfg.get('val_metadata_path', '')
+
+            if os.path.isdir(train_dir) and os.path.isdir(val_dir):
+                # Explicit separate train/val directories
+                print(f"[MultiDataModule] Using explicit train/val dirs for {train_dir}")
+                train_ds = self._build_dataset(train_dir, train_meta, ds_cfg, self.lb_dropout)
+                val_ds = self._build_dataset(val_dir, val_meta, ds_cfg, 0.0)
+            else:
+                # No val dir: split training data 90/10 (mirroring MonoDataModule)
+                print(f"[MultiDataModule] No val dir for {train_dir}, splitting 90/10")
+                full_ds = self._build_dataset(train_dir, train_meta, ds_cfg, self.lb_dropout)
+                n = len(full_ds)
+                n_train = int(0.9 * n)
+                train_ds = self._build_dataset(train_dir, train_meta, ds_cfg, self.lb_dropout)
+                val_ds = self._build_dataset(train_dir, train_meta, ds_cfg, 0.0)
+                train_ds.files = full_ds.files[:n_train]
+                val_ds.files = full_ds.files[n_train:]
+                print(f"[MultiDataModule] Train: {len(train_ds.files)} files, Val: {len(val_ds.files)} files")
+
+            train_sub_datasets.append(train_ds)
+            val_sub_datasets.append(val_ds)
+
+        train_full = torch.utils.data.ConcatDataset(train_sub_datasets)
+        val_concat = torch.utils.data.ConcatDataset(val_sub_datasets)
+
+        if self.train_p < 1.0:
+            n = len(train_full)
+            keep = max(1, int(n * self.train_p))
+            indices = list(range(n))
+            random.shuffle(indices)
+            train_ds = torch.utils.data.Subset(train_full, indices[:keep])
+        else:
+            train_ds = train_full
+
+        self.train_ds = train_ds
+        self.val_ds = val_concat
+
+    def train_dataloader(self):
+        return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers, collate_fn=custom_collate_fn)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, collate_fn=custom_collate_fn)
+
+
+# =====================
 # Training Entry Point
 # =====================
 def main():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--train_data_dir', type=str, required=True)
+    parser.add_argument('--dataset_config', type=str, default=None, help='Path to multi-dataset JSON config (mutually exclusive with --train_data_dir). Forces 24-bit Trilobyte model.')
+    parser.add_argument('--train_data_dir', type=str, default=None)
     parser.add_argument('--val_data_dir', type=str, default='')
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--model_name', type=str, default='gpt2')
     parser.add_argument('--chunk_size', type=int, default=1024)
     parser.add_argument('--sample_rate', type=int, default=None)
@@ -1070,15 +1150,36 @@ def main():
     parser.add_argument('--train_metadata_path', type=str, default=None, help='Path to metadata file for the training dataset (if any)')
     parser.add_argument('--val_metadata_path', type=str, default='', help='Path to metadata file for the validation dataset (if any)')
     args = parser.parse_args()
-    if "_" not in args.max_bit_depth:
+
+    if args.dataset_config is None and args.train_data_dir is None:
+        parser.error("Either --dataset_config or --train_data_dir must be provided.")
+
+    # When using multi-dataset config, force 24-bit Trilobyte model (max_bit_depth=None)
+    if args.dataset_config is not None:
+        args.max_bit_depth = None
+
+    if args.max_bit_depth is not None and "_" not in str(args.max_bit_depth):
         args.max_bit_depth = int(args.max_bit_depth)
+
     # set seeds
     pl.seed_everything(args.seed)
 
     wandb_logger = WandbLogger(project=args.project)
 
     model = GPTAudioLightningModule(**vars(args))
-    dm = MonoDataModule(args.train_data_dir, args.val_data_dir, batch_size=args.batch_size, chunk_size=args.chunk_size, sample_rate=args.sample_rate, split_bit=args.split_bit, only_lower_bits=args.only_lower_bits, train_p=args.train_p, stereo_interleave=args.stereo_interleave, lb_dropout=args.lb_dropout, epoch_expansion_factor=args.epoch_expansion_factor, max_bit_depth=args.max_bit_depth, train_metadata_path=args.train_metadata_path, val_metadata_path=args.val_metadata_path, encoding=args.encoding)
+
+    if args.dataset_config is not None:
+        dm = MultiDataModule(
+            dataset_config_path=args.dataset_config,
+            batch_size=args.batch_size,
+            global_chunk_size=args.chunk_size,
+            epoch_expansion_factor=args.epoch_expansion_factor,
+            lb_dropout=args.lb_dropout,
+            train_p=args.train_p,
+            num_workers=args.num_workers
+        )
+    else:
+        dm = MonoDataModule(args.train_data_dir, args.val_data_dir, batch_size=args.batch_size, chunk_size=args.chunk_size, sample_rate=args.sample_rate, split_bit=args.split_bit, only_lower_bits=args.only_lower_bits, train_p=args.train_p, stereo_interleave=args.stereo_interleave, lb_dropout=args.lb_dropout, epoch_expansion_factor=args.epoch_expansion_factor, max_bit_depth=args.max_bit_depth, train_metadata_path=args.train_metadata_path, val_metadata_path=args.val_metadata_path, encoding=args.encoding)
 
 
     checkpoint_callback = ModelCheckpoint(

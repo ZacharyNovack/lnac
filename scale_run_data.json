@@ -1,0 +1,90 @@
+{
+  "datasets": {
+    "musdb18stereo": {
+      "train_data_dir": "/mnt/arrakis_data/znovack/musdb18stereo/train/",
+      "val_data_dir": "/mnt/arrakis_data/znovack/musdb18stereo/valid/",
+      "train_metadata_path": "/graft4/code/znovack/t5_lnac/musdb18stereo_train_info.json",
+      "val_metadata_path": "/graft4/code/znovack/t5_lnac/musdbstereo_valid_mix_info.json",
+      "sample_rate": 44100,
+      "stereo_interleave": true
+    },
+    "torr": {
+      "train_data_dir": "/graft3/datasets/znovack/trilobyte/",
+      "val_data_dir": "/graft3/datasets/znovack/trilobyte/",
+      "train_metadata_path": "/graft4/code/znovack/t5_lnac/torr_new_train_info.json",
+      "val_metadata_path": "/graft4/code/znovack/t5_lnac/torr_new_val_info.json",
+      "sample_rate": 44100,
+      "stereo_interleave": true
+    },
+    "ljspeech": {
+      "train_data_dir": "/graft2/datasets/znovack/LJSpeech-1.1/wavs/",
+      "val_data_dir": "/graft2/datasets/znovack/LJSpeech-1.1/wavs/",
+      "train_metadata_path": "/graft4/code/znovack/t5_lnac/ljspeech_new_train_info.json",
+      "val_metadata_path": "/graft4/code/znovack/t5_lnac/ljspeech_new_val_info.json",
+      "sample_rate": 22050,
+      "stereo_interleave": false
+    },
+    "librispeech": {
+      "train_data_dir": "/mnt/arrakis_data/pnlong/lnac/librispeech/LibriSpeech/train-clean-100",
+      "val_data_dir": "/mnt/arrakis_data/pnlong/lnac/librispeech/LibriSpeech/dev-clean",
+      "train_metadata_path": "/graft4/code/znovack/t5_lnac/librispeech_train_info.json",
+      "val_metadata_path": "/graft4/code/znovack/t5_lnac/librispeech_val_info.json",
+      "sample_rate": 16000,
+      "stereo_interleave": false
+    },
+    "vctk": {
+      "train_data_dir": "/mnt/arrakis_data/znovack/vctk/",
+      "val_data_dir": "/mnt/arrakis_data/znovack/vctk/",
+      "train_metadata_path": "/graft4/code/znovack/t5_lnac/vctk_new_train_info.json",
+      "val_metadata_path": "/graft4/code/znovack/t5_lnac/vctk_new_val_info.json",
+      "sample_rate": 48000,
+      "stereo_interleave": false
+    },
+    "birdvox": {
+      "train_data_dir": "/mnt/arrakis_data/pnlong/lnac/birdvox/unit06/split_data/",
+      "val_data_dir": "/mnt/arrakis_data/pnlong/lnac/birdvox/unit06/split_data/",
+      "train_metadata_path": "/graft4/code/znovack/t5_lnac/birdvox_new_train_info.json",
+      "val_metadata_path": "/graft4/code/znovack/t5_lnac/birdvox_new_val_info.json",
+      "sample_rate": 24000,
+      "stereo_interleave": false
+    },
+    "epidemic": {
+      "train_data_dir": "/mnt/arrakis_data/znovack/epidemic/",
+      "val_data_dir": "/mnt/arrakis_data/znovack/epidemic/",
+      "train_metadata_path": "/graft4/code/znovack/t5_lnac/epidemic_new_train_info.json",
+      "val_metadata_path": "/graft4/code/znovack/t5_lnac/epidemic_new_val_info.json",
+      "sample_rate": 48000,
+      "stereo_interleave": false,
+      "bit_depth_cap": 16
+    },
+    "sc09": {
+      "train_data_dir": "/mnt/arrakis_data/pnlong/lnac/sc09/",
+      "val_data_dir": "/mnt/arrakis_data/pnlong/lnac/sc09/",
+      "train_metadata_path": "/graft4/code/znovack/t5_lnac/sc09_new_train_info.json",
+      "val_metadata_path": "/graft4/code/znovack/t5_lnac/sc09_new_val_info.json",
+      "sample_rate": 16000,
+      "stereo_interleave": false,
+      "encoding": "mu-law",
+      "bit_depth_cap": 8
+    },
+    "beethoven": {
+      "train_data_dir": "/mnt/arrakis_data/pnlong/lnac/beethoven/",
+      "val_data_dir": "/mnt/arrakis_data/pnlong/lnac/beethoven/",
+      "train_metadata_path": "/graft4/code/znovack/t5_lnac/beethoven_new_train_info.json",
+      "val_metadata_path": "/graft4/code/znovack/t5_lnac/beethoven_new_val_info.json",
+      "sample_rate": 16000,
+      "stereo_interleave": false,
+      "bit_depth_cap": 8
+    },
+    "youtube_mix": {
+      "train_data_dir": "/mnt/arrakis_data/pnlong/lnac/youtube_mix/",
+      "val_data_dir": "/mnt/arrakis_data/pnlong/lnac/youtube_mix/",
+      "train_metadata_path": "/graft4/code/znovack/t5_lnac/youtube_mix_new_train_info.json",
+      "val_metadata_path": "/graft4/code/znovack/t5_lnac/youtube_mix_new_val_info.json",
+      "sample_rate": 16000,
+      "stereo_interleave": false,
+      "encoding": "mu-law",
+      "bit_depth_cap": 8
+    }
+  }
+}
